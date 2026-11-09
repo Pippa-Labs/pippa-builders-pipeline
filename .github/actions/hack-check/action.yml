@@ -1,0 +1,58 @@
+name: Hackathon app check
+description: Steps of the check job of the hackathon publish workflow, one per mode (prepare, sdk, clear, check)
+
+inputs:
+  mode:
+    description: prepare, sdk, clear or check
+    required: true
+  log_level:
+    description: Global log level (DEBUG, INFO, WARN, ERROR)
+    required: false
+    default: INFO
+
+outputs:
+  ready:
+    description: false when the manifest still has the placeholder app id (mode prepare)
+    value: ${{ steps.prepare.outputs.ready }}
+  verdict:
+    description: passed or failed (modes prepare and check)
+    value: ${{ steps.prepare.outputs.verdict || steps.check.outputs.verdict }}
+  details:
+    description: Failing lines (modes prepare and check)
+    value: ${{ steps.prepare.outputs.details || steps.check.outputs.details }}
+  warnings:
+    description: Non-blocking warnings of scripts/check.py and scripts/routing_check.py (mode check)
+    value: ${{ steps.check.outputs.warnings }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check the dependencies
+      id: prepare
+      if: inputs.mode == 'prepare'
+      shell: bash
+      env:
+        LOG_LEVEL: ${{ inputs.log_level }}
+      run: bash "${{ github.action_path }}/scripts/prepare.sh"
+
+    - name: Install the Pippa SDK
+      if: inputs.mode == 'sdk'
+      shell: bash
+      env:
+        LOG_LEVEL: ${{ inputs.log_level }}
+      run: bash "${{ github.action_path }}/scripts/install-sdk.sh"
+
+    - name: Remove the credentials
+      if: inputs.mode == 'clear'
+      shell: bash
+      env:
+        LOG_LEVEL: ${{ inputs.log_level }}
+      run: bash "${{ github.action_path }}/scripts/clear-credentials.sh"
+
+    - name: Check the app
+      id: check
+      if: inputs.mode == 'check'
+      shell: bash
+      env:
+        LOG_LEVEL: ${{ inputs.log_level }}
+      run: bash "${{ github.action_path }}/scripts/check-app.sh"

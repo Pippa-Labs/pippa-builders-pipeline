@@ -1,0 +1,156 @@
+name: reusable-hack-publish
+
+on:
+  workflow_call:
+    inputs:
+      log_level:
+        description: Log level
+        required: false
+        type: string
+        default: INFO
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hack-publish-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Check
+    if: github.ref == 'refs/heads/main' && github.repository != 'Pippa-Labs/pippa-hack-template'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      ready: ${{ steps.prepare.outputs.ready }}
+      verdict: ${{ steps.prepare.outputs.verdict || steps.check.outputs.verdict }}
+      details: ${{ steps.prepare.outputs.details || steps.check.outputs.details }}
+      warnings: ${{ steps.check.outputs.warnings }}
+    steps:
+      - name: Checkout the app
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # Everything up to "Remove the credentials" runs before any app code.
+      - name: Check the dependencies
+        id: prepare
+        uses: Pippa-Labs/pippa-builders-pipeline/.github/actions/hack-check@main
+        with:
+          mode: prepare
+          log_level: ${{ inputs.log_level }}
+
+      - name: Get permission to install the Pippa SDK
+        id: aws
+        if: steps.prepare.outputs.ready == 'true' && steps.prepare.outputs.verdict != 'failed'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::780886633355:role/PippaHackSdkReadRole
+          aws-region: eu-west-2
+          role-session-name: hack-sdk-${{ github.run_id }}
+          role-duration-seconds: 900
+
+      - name: Install the Pippa SDK
+        if: steps.prepare.outputs.ready == 'true' && steps.prepare.outputs.verdict != 'failed'
+        uses: Pippa-Labs/pippa-builders-pipeline/.github/actions/hack-check@main
+        with:
+          mode: sdk
+          log_level: ${{ inputs.log_level }}
+
+      - name: Remove the credentials
+        if: ${{ always() && steps.prepare.outputs.ready == 'true' }}
+        uses: Pippa-Labs/pippa-builders-pipeline/.github/actions/hack-check@main
+        with:
+          mode: clear
+          log_level: ${{ inputs.log_level }}
+
+      - name: Check the app
+        id: check
+        if: steps.prepare.outputs.ready == 'true' && steps.prepare.outputs.verdict != 'failed'
+        uses: Pippa-Labs/pippa-builders-pipeline/.github/actions/hack-check@main
+        with:
+          mode: check
+          log_level: ${{ inputs.log_level }}
+
+      # The steps above write verdict=failed and succeed, so their outputs always reach the job.
+      - name: Fail on a code error
+        id: verdict
+        if: ${{ !cancelled() && (steps.prepare.outputs.verdict == 'failed' || steps.check.outputs.verdict == 'failed') }}
+        shell: bash
+        run: |
+          echo "::error::The check failed; nothing is published"
+          exit 1
+
+  publish:
+    name: Publish
+    needs: check
+    if: ${{ !cancelled() && needs.check.result != 'skipped' && needs.check.outputs.ready != 'false' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: pippa-publish
+    permissions:
+      contents: write
+      id-token: write
+      statuses: write
+    steps:
+      - name: Checkout the app
+        id: checkout
+        if: needs.check.result == 'success'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: app
+          persist-credentials: false
+
+      - name: Set up Python
+        id: python
+        if: ${{ !cancelled() }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install publisher dependencies
+        id: deps
+        if: needs.check.result == 'success'
+        uses: Pippa-Labs/pippa-builders-pipeline/.github/actions/hack-publish@main
+        with:
+          mode: install
+          log_level: ${{ inputs.log_level }}
+
+      # Also after a check that failed without a verdict (platform error), so the error is counted.
+      - name: Get permission to publish
+        id: aws
+        if: ${{ !cancelled() && (needs.check.result == 'success' || (needs.check.result == 'failure' && needs.check.outputs.verdict != 'failed')) }}
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::780886633355:role/PippaHackCiRole
+          aws-region: eu-west-2
+          role-session-name: hack-publish-${{ github.run_id }}
+          role-duration-seconds: 900
+
+      - name: Publish
+        if: ${{ !cancelled() }}
+        uses: Pippa-Labs/pippa-builders-pipeline/.github/actions/hack-publish@main
+        with:
+          mode: publish
+          app_dir: app
+          check_result: ${{ needs.check.result }}
+          check_verdict: ${{ needs.check.outputs.verdict }}
+          check_details: ${{ needs.check.outputs.details }}
+          check_warnings: ${{ needs.check.outputs.warnings }}
+          checkout: ${{ steps.checkout.outcome }}
+          python: ${{ steps.python.outcome }}
+          dependencies: ${{ steps.deps.outcome }}
+          credentials: ${{ steps.aws.outcome }}
+          token: ${{ github.token }}
+          log_level: ${{ inputs.log_level }}
