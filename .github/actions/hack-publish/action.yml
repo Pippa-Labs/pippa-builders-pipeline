@@ -1,0 +1,78 @@
+name: Hackathon app publish
+description: Installs the publisher dependencies (mode install), or publishes a hackathon app and reports the result on the commit (mode publish)
+
+inputs:
+  mode:
+    description: install or publish
+    required: true
+  app_dir:
+    description: Directory of the checked out app repository
+    required: false
+    default: app
+  check_result:
+    description: Result of the check job (success, failure)
+    required: false
+    default: ""
+  check_verdict:
+    description: Verdict written by the check (passed, failed)
+    required: false
+    default: ""
+  check_details:
+    description: Failing lines of the check
+    required: false
+    default: ""
+  check_warnings:
+    description: Non-blocking warnings of the check, shown on a published app
+    required: false
+    default: ""
+  checkout:
+    description: Outcome of the app checkout step
+    required: false
+    default: skipped
+  python:
+    description: Outcome of the Python setup step
+    required: false
+    default: skipped
+  dependencies:
+    description: Outcome of the dependency install step
+    required: false
+    default: skipped
+  credentials:
+    description: Outcome of the AWS role assumption step
+    required: false
+    default: skipped
+  token:
+    description: Token with statuses write and contents read on the app repository
+    required: false
+    default: ""
+  log_level:
+    description: Global log level (DEBUG, INFO, WARN, ERROR)
+    required: false
+    default: INFO
+
+runs:
+  using: composite
+  steps:
+    - name: Install publisher dependencies
+      if: inputs.mode == 'install'
+      shell: bash
+      env:
+        LOG_LEVEL: ${{ inputs.log_level }}
+      run: bash "${{ github.action_path }}/scripts/install.sh"
+
+    - name: Publish and report
+      if: inputs.mode == 'publish'
+      shell: bash
+      env:
+        APP_DIR: ${{ inputs.app_dir }}
+        CHECK_RESULT: ${{ inputs.check_result }}
+        CHECK_VERDICT: ${{ inputs.check_verdict }}
+        CHECK_DETAILS: ${{ inputs.check_details }}
+        CHECK_WARNINGS: ${{ inputs.check_warnings }}
+        CHECKOUT_OUTCOME: ${{ inputs.checkout }}
+        PYTHON_OUTCOME: ${{ inputs.python }}
+        DEPENDENCIES_OUTCOME: ${{ inputs.dependencies }}
+        CREDENTIALS: ${{ inputs.credentials }}
+        REPORT_TOKEN: ${{ inputs.token }}
+        LOG_LEVEL: ${{ inputs.log_level }}
+      run: bash "${{ github.action_path }}/hack-publish.sh"
