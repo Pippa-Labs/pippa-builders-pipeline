@@ -98,3 +98,22 @@ def test_actions_are_pinned():
 def test_only_log_level_input(workflow):
     trigger = workflow.get("on", workflow.get(True))
     assert set(trigger["workflow_call"]["inputs"]) == {"log_level"}
+
+
+def test_check_checkout_has_the_whole_history_for_the_commit_check(workflow):
+    checkout = steps(workflow, "check")[0]
+    assert checkout["uses"].startswith("actions/checkout@")
+    assert checkout["with"]["fetch-depth"] == 0
+    assert checkout["with"]["persist-credentials"] is False
+
+
+def test_personal_data_check_runs_on_every_push_before_app_code(workflow):
+    prepare = steps(workflow, "check")[2]
+    assert prepare["with"]["mode"] == "prepare"
+    assert "if" not in prepare
+
+
+def test_prepare_warnings_reach_the_publish_step(workflow):
+    assert workflow["jobs"]["check"]["outputs"]["prepare_warnings"] == "${{ steps.prepare.outputs.warnings }}"
+    publish = next(step for step in steps(workflow, "publish") if step.get("with", {}).get("mode") == "publish")
+    assert publish["with"]["prepare_warnings"] == "${{ needs.check.outputs.prepare_warnings }}"

@@ -12,7 +12,7 @@ inputs:
 
 outputs:
   ready:
-    description: false when there is nothing to publish yet, a placeholder app id or a blank app_author_name (mode prepare)
+    description: false when there is nothing to publish yet (placeholder app id or blank app_author_name) and nothing was refused (mode prepare)
     value: ${{ steps.prepare.outputs.ready }}
   verdict:
     description: passed or failed (modes prepare and check)
@@ -21,13 +21,13 @@ outputs:
     description: Failing lines (modes prepare and check)
     value: ${{ steps.prepare.outputs.details || steps.check.outputs.details }}
   warnings:
-    description: Non-blocking warnings of scripts/check.py and scripts/routing_check.py (mode check)
-    value: ${{ steps.check.outputs.warnings }}
+    description: Non-blocking warnings of the personal data check (mode prepare), or of scripts/check.py and scripts/routing_check.py (mode check)
+    value: ${{ steps.prepare.outputs.warnings || steps.check.outputs.warnings }}
 
 runs:
   using: composite
   steps:
-    - name: Check the dependencies
+    - name: Check for personal data and the dependencies
       id: prepare
       if: inputs.mode == 'prepare'
       shell: bash

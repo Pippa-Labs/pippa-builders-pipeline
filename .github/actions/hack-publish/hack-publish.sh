@@ -7,6 +7,7 @@
 #   CHECK_VERDICT         verdict written by the check
 #   CHECK_DETAILS         failing lines of the check
 #   CHECK_WARNINGS        non-blocking warnings of a passed check
+#   PREPARE_WARNINGS      non-blocking warnings of the personal data check, shown first
 #   CHECKOUT_OUTCOME      outcome of the app checkout step
 #   PYTHON_OUTCOME        outcome of the Python setup step
 #   DEPENDENCIES_OUTCOME  outcome of the dependency install step
@@ -30,6 +31,7 @@ CHECK_RESULT="${CHECK_RESULT:-}"
 CHECK_VERDICT="${CHECK_VERDICT:-}"
 CHECK_DETAILS="${CHECK_DETAILS:-}"
 CHECK_WARNINGS="${CHECK_WARNINGS:-}"
+PREPARE_WARNINGS="${PREPARE_WARNINGS:-}"
 CHECKOUT_OUTCOME="${CHECKOUT_OUTCOME:-skipped}"
 PYTHON_OUTCOME="${PYTHON_OUTCOME:-skipped}"
 DEPENDENCIES_OUTCOME="${DEPENDENCIES_OUTCOME:-skipped}"
@@ -52,10 +54,20 @@ setup_outcome() {
   fi
 }
 
+all_warnings() {
+  if [ -n "$PREPARE_WARNINGS" ] && [ -n "$CHECK_WARNINGS" ]; then
+    printf 'Personal data\n%s\n\n%s' "$PREPARE_WARNINGS" "$CHECK_WARNINGS"
+  elif [ -n "$PREPARE_WARNINGS" ]; then
+    printf 'Personal data\n%s' "$PREPARE_WARNINGS"
+  else
+    printf '%s' "$CHECK_WARNINGS"
+  fi
+}
+
 run_publisher() {
   local setup="$1"
   printf '%s' "$CHECK_DETAILS" > "$DETAILS_FILE"
-  printf '%s' "$CHECK_WARNINGS" > "$WARNINGS_FILE"
+  all_warnings > "$WARNINGS_FILE"
   env -u REPORT_TOKEN python "${HACK_DIR}/publish.py" \
     "--app-dir=${APP_DIR}" \
     "--run-url=${RUN_URL}" \

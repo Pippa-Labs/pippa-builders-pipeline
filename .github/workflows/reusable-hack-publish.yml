@@ -30,10 +30,13 @@ jobs:
       verdict: ${{ steps.prepare.outputs.verdict || steps.check.outputs.verdict }}
       details: ${{ steps.prepare.outputs.details || steps.check.outputs.details }}
       warnings: ${{ steps.check.outputs.warnings }}
+      prepare_warnings: ${{ steps.prepare.outputs.warnings }}
     steps:
+      # The whole history: the personal data check reads the commits of the push.
       - name: Checkout the app
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
@@ -42,7 +45,7 @@ jobs:
           python-version: "3.12"
 
       # Everything up to "Remove the credentials" runs before any app code.
-      - name: Check the dependencies
+      - name: Check for personal data and the dependencies
         id: prepare
         uses: Pippa-Labs/pippa-builders-pipeline/.github/actions/hack-check@main
         with:
@@ -148,6 +151,7 @@ jobs:
           check_verdict: ${{ needs.check.outputs.verdict }}
           check_details: ${{ needs.check.outputs.details }}
           check_warnings: ${{ needs.check.outputs.warnings }}
+          prepare_warnings: ${{ needs.check.outputs.prepare_warnings }}
           checkout: ${{ steps.checkout.outcome }}
           python: ${{ steps.python.outcome }}
           dependencies: ${{ steps.deps.outcome }}

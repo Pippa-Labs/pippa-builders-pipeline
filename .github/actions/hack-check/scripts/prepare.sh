@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Decides whether there is an app to publish and refuses dependencies that do not come from PyPI.
-# Runs before any app code and before any AWS credentials exist in the job.
+# Refuses personal data, decides whether there is an app to publish and refuses dependencies
+# that do not come from PyPI. Runs before any app code and before any AWS credentials exist
+# in the job.
 #
-# Nothing to publish yet: manifest.yaml still has the placeholder app id, or an
-# app_author_name that is blank (nothing_to_publish.py).
+# The personal data check always runs, also on a push with nothing to publish yet: an email
+# address in a file, or on a commit of a public repository, is refused. A refusal there makes
+# the run ready anyway, so the publish job reports it on the commit. Commit emails of a private
+# repository are warnings.
 #
-# Outputs: ready, and verdict=failed/details when the dependencies are refused. A refusal
+# Outputs: ready; verdict=failed/details when something is refused; warnings. A refusal
 # exits 0 so the outputs always reach the job; the job's last step fails on verdict=failed.
 # Exits 1 only when a check itself could not run (platform error).
 set -euo pipefail
@@ -24,7 +27,38 @@ source "${COMMON_DIR}/error-handler.sh"
 source "${ACTION_DIR}/scripts/verdict.sh"
 
 APP_DIR="${GITHUB_WORKSPACE:-$PWD}"
+WARNINGS_FILE="${RUNNER_TEMP}/hack-prepare-warnings.txt"
+FAILURES=""
 REASONS=""
+
+add_failures() {
+  if [ -n "$FAILURES" ]; then
+    FAILURES="${FAILURES}"$'\n'"$1"
+  else
+    FAILURES="$1"
+  fi
+}
+
+check_personal_data() {
+  local findings status=0
+  : > "$WARNINGS_FILE"
+  findings="$(python -I "${HACK_DIR}/personal_data.py" "--app-dir=${APP_DIR}" \
+    "--warnings-file=${WARNINGS_FILE}")" || status=$?
+  case "$status" in
+    0)
+      log_info "No personal data found"
+      ;;
+    1)
+      printf '%s\n' "$findings"
+      add_failures "$findings"
+      log_warn "Personal data found; the job fails at its last step"
+      ;;
+    *)
+      log_error "The personal data check could not run (exit ${status})"
+      exit 1
+      ;;
+  esac
+}
 
 read_reasons() {
   local status=0
@@ -44,7 +78,7 @@ check_dependencies() {
       ;;
     1)
       printf '%s\n' "$findings"
-      verdict_failed "$findings"
+      add_failures "$findings"
       log_warn "The dependencies were refused; the job fails at its last step"
       ;;
     *)
@@ -54,16 +88,37 @@ check_dependencies() {
   esac
 }
 
+write_warnings() {
+  local warnings
+  warnings="$(cat "$WARNINGS_FILE")"
+  [ -n "$warnings" ] || return 0
+  printf '%s\n' "$warnings"
+  verdict_warnings "$warnings"
+  printf '### Warnings\n\n```text\n%s\n```\n' "$warnings" >> "$GITHUB_STEP_SUMMARY"
+  log_warn "Personal data warnings; they are shown on the commit of a published app"
+}
+
 main() {
+  check_personal_data
   read_reasons
-  if [ -n "$REASONS" ]; then
+  write_warnings
+
+  if [ -n "$REASONS" ] && [ -z "$FAILURES" ]; then
     echo "ready=false" >> "$GITHUB_OUTPUT"
     printf '### Nothing to publish yet\n\n%s\n' "$REASONS" >> "$GITHUB_STEP_SUMMARY"
     log_info "Nothing to publish yet: ${REASONS//$'\n'/ }"
     exit 0
   fi
+
   echo "ready=true" >> "$GITHUB_OUTPUT"
-  check_dependencies
+  if [ -z "$REASONS" ]; then
+    check_dependencies
+  else
+    log_warn "Nothing to publish yet, but personal data was found; it is reported on the commit"
+  fi
+  if [ -n "$FAILURES" ]; then
+    verdict_failed "$FAILURES"
+  fi
 }
 
 main "$@"

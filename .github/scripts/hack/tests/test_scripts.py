@@ -1,6 +1,7 @@
 """Runs the hack-check and hack-publish scripts with stubbed gh, aws and pip."""
 
 import json
+import os
 import shutil
 import subprocess
 
@@ -81,7 +82,36 @@ def test_prepare_guard_crash_fails_without_verdict(tmp_path, bin_dir):
     assert "could not run (exit 3)" in result.stderr
 
 
+# ---- prepare: nothing to publish yet, and personal data ----
+
+# Invented addresses: college.local is never a real mailbox; a commit email is refused
+# unless it is a GitHub no-reply address, so example.com works for commits.
+PERSONAL = "ada.lovelace" + "@" + "college.local"
+NOREPLY = "1234567+tide-watcher@users.noreply.github.com"
 AUTHOR_BLANK = 'app_author_name: ""\n' + MANIFEST
+
+
+def git(app, *args, email=NOREPLY):
+    env = {**os.environ, "GIT_AUTHOR_NAME": "Tide Watcher", "GIT_AUTHOR_EMAIL": email,
+           "GIT_COMMITTER_NAME": "Tide Watcher", "GIT_COMMITTER_EMAIL": email,
+           "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+    return subprocess.run(["git", "-C", str(app), *args], env=env, capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def commit_all(app, email=NOREPLY):
+    if not (app / ".git").exists():
+        git(app, "init", "-q")
+    git(app, "add", "-A")
+    git(app, "commit", "-q", "--allow-empty", "-m", "Change the app", email=email)
+    return git(app, "rev-parse", "HEAD")
+
+
+def push_env(tmp_path, before, after, private):
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({"before": before, "after": after, "commits": [],
+                                 "repository": {"private": private}}))
+    return {"GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_PATH": str(event), "GITHUB_SHA": after}
 
 
 def test_prepare_blank_author_name_is_nothing_to_publish(tmp_path, bin_dir):
@@ -100,6 +130,98 @@ def test_prepare_placeholder_and_blank_author_name_give_both_reasons(tmp_path, b
     assert "ready=false" in output
     assert "placeholder app id hack.your_app_name_here" in summary
     assert "choose your public author name" in summary
+
+
+def test_prepare_refuses_an_email_address_in_a_file(tmp_path, bin_dir):
+    app = make_app(tmp_path)
+    (app / "notes.md").write_text(f"# Notes\nAsk {PERSONAL}\n")
+    result, output, _ = run_check_script(tmp_path, bin_dir, app, "prepare.sh")
+    assert result.returncode == 0, result.stderr
+    assert "ready=true" in output and "verdict=failed" in output
+    assert " FAIL notes.md:2 has an email address (a***@college.local)" in output
+    assert "nothing personal belongs in this repository" in output
+    assert PERSONAL not in output + result.stdout + result.stderr
+
+
+def test_prepare_reports_personal_data_even_with_nothing_to_publish(tmp_path, bin_dir):
+    app = make_app(tmp_path, manifest=PLACEHOLDER)
+    (app / "notes.md").write_text(f"Ask {PERSONAL}\n")
+    result, output, summary = run_check_script(tmp_path, bin_dir, app, "prepare.sh")
+    assert result.returncode == 0, result.stderr
+    assert "ready=true" in output and "verdict=failed" in output
+    assert "Nothing to publish yet" not in summary
+
+
+def test_prepare_lists_personal_data_and_dependency_refusals_together(tmp_path, bin_dir):
+    app = make_app(tmp_path, requirements="pippa_agentapp_sdk==0.1.3\n")
+    (app / "notes.md").write_text(f"Ask {PERSONAL}\n")
+    result, output, _ = run_check_script(tmp_path, bin_dir, app, "prepare.sh")
+    assert result.returncode == 0, result.stderr
+    assert output.count("verdict=failed") == 1
+    details = output_value(output, "details")
+    assert " FAIL notes.md:1 has an email address" in details
+    assert " FAIL requirements-dev.txt line 1 installs the Pippa SDK" in details
+
+
+def test_prepare_refuses_a_personal_commit_email_in_a_public_repository(tmp_path, bin_dir):
+    app = make_app(tmp_path)
+    base = commit_all(app)
+    (app / "helper.py").write_text("X = 1\n")
+    tip = commit_all(app, email=PERSONAL)
+    result, output, _ = run_check_script(tmp_path, bin_dir, app, "prepare.sh",
+                                         **push_env(tmp_path, base, tip, private=False))
+    assert result.returncode == 0, result.stderr
+    assert "verdict=failed" in output
+    assert (f" FAIL commit {tip[:7]} (author and committer): Your commit shows the email address "
+            "a***@college.local publicly.") in output
+    assert PERSONAL not in output + result.stdout + result.stderr
+
+
+def test_prepare_warns_on_a_personal_commit_email_in_a_private_repository(tmp_path, bin_dir):
+    app = make_app(tmp_path)
+    base = commit_all(app)
+    (app / "helper.py").write_text("X = 1\n")
+    tip = commit_all(app, email="builder@example.com")
+    result, output, summary = run_check_script(tmp_path, bin_dir, app, "prepare.sh",
+                                               **push_env(tmp_path, base, tip, private=True))
+    assert result.returncode == 0, result.stderr
+    assert "ready=true" in output and "verdict" not in output
+    warnings = output_value(output, "warnings")
+    assert warnings.startswith(f" WARN commit {tip[:7]} (author and committer): This commit shows the email "
+                               "address b***@example.com")
+    assert "### Warnings" in summary and "b***@example.com" in summary
+
+
+def test_prepare_warnings_alone_do_not_publish_a_placeholder_app(tmp_path, bin_dir):
+    app = make_app(tmp_path, manifest=PLACEHOLDER)
+    base = commit_all(app)
+    (app / "helper.py").write_text("X = 1\n")
+    tip = commit_all(app, email="builder@example.com")
+    result, output, summary = run_check_script(tmp_path, bin_dir, app, "prepare.sh",
+                                               **push_env(tmp_path, base, tip, private=True))
+    assert result.returncode == 0, result.stderr
+    assert "ready=false" in output and "verdict" not in output
+    assert "### Warnings" in summary and "### Nothing to publish yet" in summary
+
+
+def test_prepare_passes_a_clean_push(tmp_path, bin_dir):
+    app = make_app(tmp_path)
+    base = commit_all(app)
+    (app / "helper.py").write_text("X = 1\n")
+    tip = commit_all(app)
+    result, output, _ = run_check_script(tmp_path, bin_dir, app, "prepare.sh",
+                                         **push_env(tmp_path, base, tip, private=False))
+    assert result.returncode == 0, result.stderr
+    assert "ready=true" in output and "verdict" not in output and "warnings" not in output
+
+
+def test_prepare_personal_data_check_crash_fails_without_verdict(tmp_path, bin_dir):
+    app = make_app(tmp_path)
+    result, output, _ = run_check_script(tmp_path, bin_dir, app, "prepare.sh",
+                                         **push_env(tmp_path, "a" * 40, "b" * 40, private=False))
+    assert result.returncode == 1
+    assert "verdict" not in output and "ready" not in output
+    assert "The personal data check could not run (exit 2)" in result.stderr
 
 
 # ---- install-sdk ----
@@ -435,3 +557,23 @@ def test_publish_hands_the_check_warnings_to_the_module(tmp_path, bin_dir):
                             CHECKOUT_OUTCOME="skipped", DEPENDENCIES_OUTCOME="skipped", CREDENTIALS="skipped")
     assert result.returncode == 1
     assert read(tmp_path / "runner" / "hack-check-warnings.txt") == " WARN owner_email is missing"
+
+
+def test_publish_puts_the_personal_data_warnings_first(tmp_path, bin_dir):
+    make_app(tmp_path)
+    result, _ = run_publish(tmp_path, bin_dir, CHECK_RESULT="failure", CHECK_VERDICT="failed",
+                            CHECK_DETAILS=" FAIL x", CHECK_WARNINGS="scripts/check.py\n WARN y",
+                            PREPARE_WARNINGS=" WARN commit 1234567 (author): z",
+                            CHECKOUT_OUTCOME="skipped", DEPENDENCIES_OUTCOME="skipped", CREDENTIALS="skipped")
+    assert result.returncode == 1
+    assert read(tmp_path / "runner" / "hack-check-warnings.txt") == (
+        "Personal data\n WARN commit 1234567 (author): z\n\nscripts/check.py\n WARN y"
+    )
+
+
+def test_publish_with_only_personal_data_warnings(tmp_path, bin_dir):
+    make_app(tmp_path)
+    run_publish(tmp_path, bin_dir, CHECK_RESULT="failure", CHECK_VERDICT="failed", CHECK_DETAILS=" FAIL x",
+                PREPARE_WARNINGS=" WARN commit 1234567 (author): z", CHECKOUT_OUTCOME="skipped",
+                DEPENDENCIES_OUTCOME="skipped", CREDENTIALS="skipped")
+    assert read(tmp_path / "runner" / "hack-check-warnings.txt") == "Personal data\n WARN commit 1234567 (author): z"
