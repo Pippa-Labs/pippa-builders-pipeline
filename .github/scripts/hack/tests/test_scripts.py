@@ -4,7 +4,8 @@ import json
 import shutil
 import subprocess
 
-from conftest import CHECK_ACTION_DIR, PLACEHOLDER, PUBLISH_ACTION_DIR, base_env, make_app, read, write_exec
+from conftest import (CHECK_ACTION_DIR, MANIFEST, PLACEHOLDER, PUBLISH_ACTION_DIR, base_env, make_app, read,
+                      write_exec)
 
 SHA = "a" * 64
 PARAMETER = json.dumps({
@@ -78,6 +79,27 @@ def test_prepare_guard_crash_fails_without_verdict(tmp_path, bin_dir):
     assert result.returncode == 1
     assert "verdict" not in output
     assert "could not run (exit 3)" in result.stderr
+
+
+AUTHOR_BLANK = 'app_author_name: ""\n' + MANIFEST
+
+
+def test_prepare_blank_author_name_is_nothing_to_publish(tmp_path, bin_dir):
+    app = make_app(tmp_path, manifest=AUTHOR_BLANK, requirements="pippa_agentapp_sdk==0.1.3\n")
+    result, output, summary = run_check_script(tmp_path, bin_dir, app, "prepare.sh")
+    assert result.returncode == 0, result.stderr
+    assert "ready=false" in output and "verdict" not in output
+    assert summary.startswith("### Nothing to publish yet\n\nNothing to publish yet: choose your public author "
+                              "name (app_author_name in manifest.yaml). Claude will ask you for it.")
+
+
+def test_prepare_placeholder_and_blank_author_name_give_both_reasons(tmp_path, bin_dir):
+    app = make_app(tmp_path, manifest='app_author_name: ""\n' + PLACEHOLDER)
+    result, output, summary = run_check_script(tmp_path, bin_dir, app, "prepare.sh")
+    assert result.returncode == 0, result.stderr
+    assert "ready=false" in output
+    assert "placeholder app id hack.your_app_name_here" in summary
+    assert "choose your public author name" in summary
 
 
 # ---- install-sdk ----

@@ -36,7 +36,7 @@ Publishing works only from this workflow on `main` and only for app repositories
 
 **Check** (runs the app's code)
 
-1. Skips the run when `manifest.yaml` still has the placeholder app id `hack.your_app_name_here`.
+1. Skips the run ("Nothing to publish yet" in the run summary; no commit status, no comment) when `manifest.yaml` still has the placeholder app id `hack.your_app_name_here`, or has an `app_author_name` key whose value is blank (the template ships `app_author_name: ""`; Claude asks the builder for their public author name). A manifest without the key is not held back.
 2. Refuses, as a code error, an app that:
    - names the Pippa SDK in a requirements file (the build installs it);
    - sets a package index or download location (`-i`, `--index-url`, `--extra-index-url`, `-f`, `--find-links`);
