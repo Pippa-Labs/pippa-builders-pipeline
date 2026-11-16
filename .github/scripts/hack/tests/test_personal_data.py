@@ -146,8 +146,8 @@ def test_file_findings_name_file_and_line_and_mask_the_address(tmp_path, capsys)
     code, out, warnings = scan(repo, tmp_path, capsys=capsys)
     assert code == 1
     assert out.splitlines() == [
-        " FAIL docs/notes.md:3 has an email address (a***@college.local)",
-        " FAIL docs/notes.md:3 has an email address (g***@college.local)",
+        " FAIL docs/notes.md:3 contains the email address a***@college.local",
+        " FAIL docs/notes.md:3 contains the email address g***@college.local",
         f"       {pd.FILE_FIX}",
     ]
     assert PERSONAL not in out and "lovelace" not in out
@@ -382,7 +382,7 @@ def test_commit_and_file_findings_together_commits_first(tmp_path, capsys):
     lines = out.splitlines()
     assert code == 1
     assert lines[0].startswith(f" FAIL commit {tip[:7]}")
-    assert lines[1] == " FAIL notes.md:1 has an email address (g***@college.local)"
+    assert lines[1] == " FAIL notes.md:1 contains the email address g***@college.local"
     assert lines[2] == f"       {pd.FILE_FIX}"
 
 

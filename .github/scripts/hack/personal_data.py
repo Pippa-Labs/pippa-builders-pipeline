@@ -168,7 +168,7 @@ class FileScan:
                 continue
             for number, line in enumerate(text.split("\n"), start=1):
                 for shown in dict.fromkeys(mask(address) for address in addresses(line)):
-                    found.append(Finding(f"{relative}:{number}", f"has an email address ({shown})"))
+                    found.append(Finding(f"{relative}:{number}", f"contains the email address {shown}"))
         return found
 
     def _text(self, relative: str) -> str | None:

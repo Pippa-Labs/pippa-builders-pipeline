@@ -138,7 +138,7 @@ def test_prepare_refuses_an_email_address_in_a_file(tmp_path, bin_dir):
     result, output, _ = run_check_script(tmp_path, bin_dir, app, "prepare.sh")
     assert result.returncode == 0, result.stderr
     assert "ready=true" in output and "verdict=failed" in output
-    assert " FAIL notes.md:2 has an email address (a***@college.local)" in output
+    assert " FAIL notes.md:2 contains the email address a***@college.local" in output
     assert "nothing personal belongs in this repository" in output
     assert PERSONAL not in output + result.stdout + result.stderr
 
@@ -159,7 +159,7 @@ def test_prepare_lists_personal_data_and_dependency_refusals_together(tmp_path, 
     assert result.returncode == 0, result.stderr
     assert output.count("verdict=failed") == 1
     details = output_value(output, "details")
-    assert " FAIL notes.md:1 has an email address" in details
+    assert " FAIL notes.md:1 contains the email address" in details
     assert " FAIL requirements-dev.txt line 1 installs the Pippa SDK" in details
 
 
