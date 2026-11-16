@@ -301,10 +301,26 @@ def test_public_push_with_a_personal_commit_email_is_refused(tmp_path, capsys):
     assert out == (
         f" FAIL commit {tip[:7]} (author and committer): Your commit shows the email address "
         "a***@college.local publicly. Set `git config user.email` to your GitHub no-reply address "
-        "and amend the commit.\n"
+        "(and `user.name` to your public author name), then commit and push again; "
+        "`git commit --allow-empty` will do if nothing else changed. A commit that is already "
+        "pushed can't be changed: ask an organiser if it must leave the history.\n"
     )
     assert PERSONAL not in out
     assert warnings == ""
+
+
+def test_the_public_commit_fix_is_a_new_commit_and_it_clears_the_refusal(tmp_path, capsys):
+    """main refuses a force push, so an amended commit can never land: the fix must be a new one."""
+    assert "amend" not in pd.PUBLIC_COMMIT
+    repo = new_repo(tmp_path)
+    base = commit(repo, "a.py")
+    refused = commit(repo, "b.py", author=PERSONAL)
+    first = event_file(tmp_path, private=False, before=base, after=refused)
+    assert scan(repo, tmp_path, "push", first, refused, capsys=capsys)[0] == 1
+    git(repo, "commit", "--allow-empty", "-q", "-m", "Use the no-reply address", author=NOREPLY)
+    fixed = git(repo, "rev-parse", "HEAD")
+    second = event_file(tmp_path, private=False, before=refused, after=fixed)
+    assert scan(repo, tmp_path, "push", second, fixed, capsys=capsys)[:2] == (0, "")
 
 
 def test_private_push_with_a_personal_commit_email_is_a_warning(tmp_path, capsys):

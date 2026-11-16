@@ -77,9 +77,16 @@ FILE_FIX = (
     "Remove it: nothing personal belongs in this repository. "
     "For an example or a test, use an address at example.com."
 )
+#: The commit is already on main, which nobody but an admin can rewrite (the hack-main
+#: ruleset refuses a force push), and only commits after the run's `before` are checked.
+#: So the fix is a new commit, never an amended one: an amend can't be pushed, and after
+#: `git pull --rebase` it vanishes into the commit already upstream, leaving nothing to push.
 PUBLIC_COMMIT = (
     "Your commit shows the email address {address} publicly. Set `git config user.email` "
-    "to your GitHub no-reply address and amend the commit."
+    "to your GitHub no-reply address (and `user.name` to your public author name), then "
+    "commit and push again; `git commit --allow-empty` will do if nothing else changed. "
+    "A commit that is already pushed can't be changed: ask an organiser if it must leave "
+    "the history."
 )
 PRIVATE_COMMIT = (
     "This commit shows the email address {address} to everybody who can read this repository."
