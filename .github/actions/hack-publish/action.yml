@@ -25,6 +25,10 @@ inputs:
     description: Non-blocking warnings of the check, shown on a published app
     required: false
     default: ""
+  prepare_warnings:
+    description: Non-blocking warnings of the personal data check, shown on a published app before those of the check
+    required: false
+    default: ""
   checkout:
     description: Outcome of the app checkout step
     required: false
@@ -69,6 +73,7 @@ runs:
         CHECK_VERDICT: ${{ inputs.check_verdict }}
         CHECK_DETAILS: ${{ inputs.check_details }}
         CHECK_WARNINGS: ${{ inputs.check_warnings }}
+        PREPARE_WARNINGS: ${{ inputs.prepare_warnings }}
         CHECKOUT_OUTCOME: ${{ inputs.checkout }}
         PYTHON_OUTCOME: ${{ inputs.python }}
         DEPENDENCIES_OUTCOME: ${{ inputs.dependencies }}

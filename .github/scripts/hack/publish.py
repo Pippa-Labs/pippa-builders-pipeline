@@ -2,10 +2,13 @@
 """Publishes a hackathon Agent App through the Pippa publisher and builds the report.
 
 Packages the app, requests a GitHub OIDC token for the publisher, invokes the
-publisher Lambda and classifies the result as success, code error or platform
-error. Writes the report files the action posts:
+publisher Lambda and classifies the result as success, code error, refusal or
+platform error. A refusal is the publisher saying no for a reason that is not
+in the app's code (`error_kind: "refused"`): the repository is not linked to a
+Pippa account, or manifest.yaml has something Pippa does not accept. Writes the
+report files the action posts:
 
-    outcome       success, code or infra
+    outcome       success, code, refused or infra
     status.json   body for POST /repos/{owner}/{repo}/statuses/{sha}
     comment.json  body for POST /repos/{owner}/{repo}/commits/{sha}/comments
     summary.md    step summary
@@ -43,6 +46,10 @@ STATUS_CONTEXT = "pippa/publish"
 STATUS_DESCRIPTION_LIMIT = 140
 DETAILS_LIMIT = 6000
 WARNINGS_LIMIT = 3000
+#: Pippa's own warnings on a published app: at most this many, each cut to this many characters.
+RUNTIME_WARNINGS_COUNT = 10
+RUNTIME_WARNING_LIMIT = 500
+RUNTIME_WARNINGS_TITLE = "Pippa"
 
 PUBLISH_FUNCTION = "pippa-hack-publish"
 PUBLISH_REGION = "eu-west-2"
@@ -56,7 +63,12 @@ THROTTLE_CODE = "TooManyRequestsException"
 
 APP_URL = "https://app.getpippa.ai"
 CODE_MARKER = "CODE_ERROR"
+REFUSED_MARKER = "REFUSED"
 PLATFORM_MARKER = "PLATFORM_ERROR"
+#: The publisher's `error_kind` of a refusal that is about the repository, not its code.
+#: It comes with `error_class: "code"`, so an older pipeline still shows the sentence.
+REFUSED_KIND = "refused"
+REFUSED_WITHOUT_REASON = "Pippa refused to publish this app without giving a reason. Ask an organiser."
 
 MAX_BUNDLE_BYTES = 3 * 1024 * 1024
 SKIP_DIRS = frozenset({
@@ -115,6 +127,15 @@ def first_line(text: str) -> str:
     return ""
 
 
+def runtime_warnings(reply: dict[str, Any]) -> list[str]:
+    """The sentences in the publisher's `warnings`, one line each; [] from a publisher that sends none."""
+    value = reply.get("warnings")
+    if not isinstance(value, list):
+        return []
+    sentences = [" ".join(item.split()) for item in value if isinstance(item, str)]
+    return [truncate(item, RUNTIME_WARNING_LIMIT) for item in sentences if item][:RUNTIME_WARNINGS_COUNT]
+
+
 class Outcome(ABC):
     """Result of a publish run, rendered as commit status, commit comment and summary."""
 
@@ -157,6 +178,7 @@ class Published(Outcome):
     def __init__(self, run_url: str, reply: dict[str, Any], warnings: str = "") -> None:
         super().__init__(run_url)
         self.warnings = truncate(warnings, WARNINGS_LIMIT)
+        self.runtime_warnings = runtime_warnings(reply)
         self.app_id = str(reply["app_id"])
         self.version = str(reply["version"])
         self.name = str(reply["name"])
@@ -168,15 +190,26 @@ class Published(Outcome):
         return f"Live: {self.app_id} v{self.version}"
 
     @property
+    def all_warnings(self) -> str:
+        """Pippa's own warnings first, as WARN lines under one title, then those of the build."""
+        sections = []
+        if self.runtime_warnings:
+            lines = [f" WARN {sentence}" for sentence in self.runtime_warnings]
+            sections.append("\n".join([RUNTIME_WARNINGS_TITLE, *lines]))
+        if self.warnings:
+            sections.append(self.warnings)
+        return "\n\n".join(sections)
+
+    @property
     def message(self) -> str:
         message = (
             f"Your app {self.name} ({self.app_id} v{self.version}) is live. "
             f"Open {APP_URL}, go to Apps, install it and try it."
         )
-        if self.warnings:
+        if self.all_warnings:
             message += (
                 "\n\nWarnings (they did not stop the publish; fix them and push again):\n\n"
-                f"{fence(self.warnings)}"
+                f"{fence(self.all_warnings)}"
             )
         return message
 
@@ -204,6 +237,36 @@ class CodeFailure(Outcome):
             f"{CODE_MARKER}: the app was not published because of a problem in its code.\n\n"
             f"{fence(self.error)}\n\n"
             f"Fix the code and push again.\n\n"
+            f"Run log: {self.run_url}"
+        )
+
+
+class Refusal(Outcome):
+    """Pippa said no before anything was deployed, for a reason outside the app's code.
+
+    The sentence comes from the runtime and says what to do. It is fenced like a code
+    error's text: it can quote names from manifest.yaml, which must not become Markdown.
+    """
+
+    kind = "refused"
+    state = "failure"
+
+    def __init__(self, run_url: str, detail: str) -> None:
+        super().__init__(run_url)
+        self.detail = truncate(detail, DETAILS_LIMIT) or REFUSED_WITHOUT_REASON
+
+    @property
+    def description(self) -> str:
+        return f"Refused: {first_line(self.detail)}"
+
+    @property
+    def message(self) -> str:
+        return (
+            f"{REFUSED_MARKER}: the app was not published:\n\n"
+            f"{fence(self.detail)}\n\n"
+            "Nothing was published, and every version published before is unchanged. This is not "
+            "a problem in the app's code: do what the message "
+            "says, then push again. If it says to ask an organiser, changing the code will not help.\n\n"
             f"Run log: {self.run_url}"
         )
 
@@ -240,6 +303,9 @@ class OutcomeFactory:
     def code(self, error: str) -> CodeFailure:
         return CodeFailure(self.run_url, error)
 
+    def refused(self, detail: str) -> Refusal:
+        return Refusal(self.run_url, detail)
+
     def platform(self, reference: str | None = None) -> PlatformFailure:
         return PlatformFailure(self.run_url, reference or self.reference)
 
@@ -260,13 +326,18 @@ class OutcomeFactory:
             if missing:
                 raise PlatformError(f"Publisher success reply lacks {missing}: {reply!r:.400}")
             published = Published(self.run_url, reply, self.warnings)
+            notes = "".join(f"  Warning  {sentence}\n" for sentence in published.runtime_warnings)
             print(
                 f"\n{'=' * 68}\n  YOUR APP IS LIVE IN PIPPA\n\n"
                 f"  App      {published.name}  ({published.app_id} v{published.version})\n"
-                f"  Can do   {', '.join(published.outcomes) or '-'}\n{'=' * 68}"
+                f"  Can do   {', '.join(published.outcomes) or '-'}\n{notes}{'=' * 68}"
             )
             return published
         error_class = reply.get("error_class")
+        if error_class == REFUSED_KIND or (error_class == "code" and reply.get("error_kind") == REFUSED_KIND):
+            detail = str(reply.get("error") or "")
+            print(f"\n{'=' * 68}\n{REFUSED_MARKER}: the app was not published:\n\n  {detail}\n{'=' * 68}")
+            return self.refused(detail)
         if error_class == "code":
             error = str(reply.get("error") or "")
             print(f"\n{'=' * 68}\nPippa refused to publish this app:\n\n  {error}\n{'=' * 68}")
