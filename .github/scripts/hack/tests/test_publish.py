@@ -464,3 +464,144 @@ def test_main_reads_the_warnings_file(app, tmp_path, monkeypatch):
                     "--out-dir", str(out), "--check-warnings-file", str(warnings_file)]) == 0
     assert (out / "outcome").read_text() == "success"
     assert "owner_email is still" in json.loads((out / "comment.json").read_text())["body"]
+
+
+# ---- refusals: the publisher says no before deploying, for a reason outside the code ----
+
+NOT_LINKED = (
+    "This repository isn't linked to a Pippa builder account, so it can't publish. Apps are published "
+    "only from the repository Pippa Labs created for you: a fork or a copy can't publish. If you think "
+    "this is wrong, ask an organiser."
+)
+
+
+def refusal_reply(error=NOT_LINKED, **extra):
+    return {"statusCode": 403, "ok": False, "error_class": "code", "error_kind": "refused",
+            "error": error, **extra}
+
+
+def test_publisher_refusal_is_refused_not_a_code_error(app, capsys):
+    run, client = make_run(app, FakeClient(json.dumps(refusal_reply()).encode()))
+    outcome = run.execute(hp.CheckState())
+    assert len(client.calls) == 1
+    assert outcome.kind == "refused"
+    body = outcome.comment_payload()["body"]
+    assert body.startswith("REFUSED: the app was not published:\n\n```text\nThis repository isn't linked")
+    assert "CODE_ERROR" not in body and "problem in its code" not in body
+    assert "Nothing was deployed. This is not a problem in the app's code" in body
+    assert body.endswith(f"Run log: {RUN_URL}")
+    status = outcome.status_payload()
+    assert status["state"] == "failure" and status["context"] == "pippa/publish"
+    assert status["description"].startswith("Refused: This repository isn't linked")
+    assert len(status["description"]) <= hp.STATUS_DESCRIPTION_LIMIT and status["description"].endswith("...")
+    assert "REFUSED: the app was not published:" in capsys.readouterr().out
+
+
+def test_refused_error_class_alone_is_a_refusal(app):
+    reply = {"statusCode": 403, "ok": False, "error_class": "refused", "error": "Remove `owner_email`."}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    outcome = run.execute(hp.CheckState())
+    assert outcome.kind == "refused"
+    assert outcome.status_payload()["description"] == "Refused: Remove `owner_email`."
+
+
+def test_code_error_without_refused_kind_stays_a_code_error(app):
+    reply = {"statusCode": 403, "ok": False, "error_class": "code", "error_kind": "something-else",
+             "error": "your app did not return a usable result when called"}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    assert run.execute(hp.CheckState()).kind == "code"
+
+
+def test_infra_with_refused_kind_stays_infra(app):
+    reply = {"statusCode": 500, "ok": False, "error_class": "infra", "error_kind": "refused",
+             "error": "x", "reference": "pub-1"}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    assert run.execute(hp.CheckState()).kind == "infra"
+
+
+def test_refusal_without_a_sentence_says_so(app):
+    run, _ = make_run(app, FakeClient(json.dumps(refusal_reply(error="")).encode()))
+    outcome = run.execute(hp.CheckState())
+    assert outcome.kind == "refused"
+    assert "without giving a reason. Ask an organiser." in outcome.comment_payload()["body"]
+
+
+def test_refusal_text_is_fenced_so_manifest_names_are_not_markdown(app):
+    detail = ('Another builder already uses the name "@someone [x](https://example.com/y)". '
+              "Choose a different app_author_name.")
+    run, _ = make_run(app, FakeClient(json.dumps(refusal_reply(error=detail)).encode()))
+    body = run.execute(hp.CheckState()).comment_payload()["body"]
+    fenced = body.split("```text\n", 1)[1].split("\n```", 1)[0]
+    assert fenced == detail
+    assert body.count("@someone") == 1
+
+
+def test_refusal_ignores_the_check_warnings(app):
+    run, _ = make_run(app, FakeClient(json.dumps(refusal_reply()).encode()))
+    run.factory = hp.OutcomeFactory(RUN_URL, REF, WARNINGS)
+    assert "Warnings" not in run.execute(hp.CheckState()).comment_payload()["body"]
+
+
+def test_refusal_details_are_cut():
+    outcome = hp.Refusal(RUN_URL, "z" * 20000)
+    assert len(outcome.detail) == hp.DETAILS_LIMIT
+
+
+def test_main_writes_a_refused_outcome(app, tmp_path, monkeypatch):
+    out = tmp_path / "out"
+    real_publisher = hp.LambdaPublisher
+    monkeypatch.setattr(hp, "LambdaPublisher", lambda: real_publisher(
+        client=FakeClient(json.dumps(refusal_reply()).encode()), sleep=lambda _: None))
+    monkeypatch.setattr(hp, "ActionsTokenProvider", FakeToken)
+    assert hp.main(["--app-dir", str(app), "--run-url", RUN_URL, "--reference", REF,
+                    "--out-dir", str(out)]) == 0
+    assert (out / "outcome").read_text() == "refused"
+    assert json.loads((out / "comment.json").read_text())["body"].startswith("REFUSED")
+    assert json.loads((out / "status.json").read_text())["description"].startswith("Refused: ")
+
+
+# ---- Pippa's own warnings on a published app ----
+
+IGNORED_OWNER = ("owner_email in manifest.yaml is ignored: Pippa knows who owns this app from your "
+                 "repository. Remove it.")
+LEGACY_PUBLISHER = ("Add app_author_name to manifest.yaml: the public name shown with your app. Until "
+                    "then it shows `publisher`.")
+
+
+def test_success_lists_the_runtime_warnings_before_the_build_warnings(app, capsys):
+    reply = {**SUCCESS, "warnings": [IGNORED_OWNER, LEGACY_PUBLISHER]}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    run.factory = hp.OutcomeFactory(RUN_URL, REF, WARNINGS)
+    outcome = run.execute(hp.CheckState())
+    assert outcome.kind == "success" and outcome.state == "success"
+    body = outcome.comment_payload()["body"]
+    block = body.split("```text\n", 1)[1].split("\n```", 1)[0]
+    assert block.startswith(f"Pippa\n WARN {IGNORED_OWNER}\n WARN {LEGACY_PUBLISHER}\n\nscripts/check.py\n")
+    assert "1 problem(s) that will stop your app being chosen." in block
+    assert outcome.status_payload()["description"] == "Live: hack.x v0.1.0"
+    assert f"Warning  {IGNORED_OWNER}" in capsys.readouterr().out
+
+
+def test_runtime_warnings_alone_make_a_warnings_section(app):
+    reply = {**SUCCESS, "warnings": [LEGACY_PUBLISHER]}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    body = run.execute(hp.CheckState()).comment_payload()["body"]
+    assert "Warnings (they did not stop the publish; fix them and push again):" in body
+    assert f"```text\nPippa\n WARN {LEGACY_PUBLISHER}\n```" in body
+
+
+@pytest.mark.parametrize("warnings", [None, "one sentence", {"a": 1}, [], [1, None, "", "   "]])
+def test_missing_or_odd_runtime_warnings_add_nothing(app, warnings):
+    reply = {**SUCCESS, "warnings": warnings}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    outcome = run.execute(hp.CheckState())
+    assert outcome.runtime_warnings == []
+    assert "Warnings" not in outcome.comment_payload()["body"]
+
+
+def test_runtime_warnings_are_one_line_each_counted_and_cut():
+    warnings = ["  two\nlines  ", "x" * 1000] + [f"warning {n}" for n in range(20)]
+    published = hp.Published(RUN_URL, {**SUCCESS, "warnings": warnings})
+    assert len(published.runtime_warnings) == hp.RUNTIME_WARNINGS_COUNT
+    assert published.runtime_warnings[0] == "two lines"
+    assert len(published.runtime_warnings[1]) == hp.RUNTIME_WARNING_LIMIT
