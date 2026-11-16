@@ -488,7 +488,8 @@ def test_publisher_refusal_is_refused_not_a_code_error(app, capsys):
     body = outcome.comment_payload()["body"]
     assert body.startswith("REFUSED: the app was not published:\n\n```text\nThis repository isn't linked")
     assert "CODE_ERROR" not in body and "problem in its code" not in body
-    assert "Nothing was deployed. This is not a problem in the app's code" in body
+    assert "Nothing was published, and every version published before is unchanged. This is not " in body
+    assert "a problem in the app's code" in body
     assert body.endswith(f"Run log: {RUN_URL}")
     status = outcome.status_payload()
     assert status["state"] == "failure" and status["context"] == "pippa/publish"

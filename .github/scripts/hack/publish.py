@@ -264,7 +264,8 @@ class Refusal(Outcome):
         return (
             f"{REFUSED_MARKER}: the app was not published:\n\n"
             f"{fence(self.detail)}\n\n"
-            "Nothing was deployed. This is not a problem in the app's code: do what the message "
+            "Nothing was published, and every version published before is unchanged. This is not "
+            "a problem in the app's code: do what the message "
             "says, then push again. If it says to ask an organiser, changing the code will not help.\n\n"
             f"Run log: {self.run_url}"
         )
