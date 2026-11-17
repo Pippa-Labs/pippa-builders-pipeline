@@ -132,9 +132,11 @@ CURLY_APOSTROPHE = "\N{RIGHT SINGLE QUOTATION MARK}"
 KEYS_MISSING = re.compile(r"\b(?:can[\u2019']?t|cannot|can not)\s+run\s+until\s+you\s+add\b", re.IGNORECASE)
 
 MAX_BUNDLE_BYTES = 3 * 1024 * 1024
+#: Folders never packaged, at any depth. `.claude` holds the builder's Claude Code settings (the
+#: templates ship `.claude/settings.json`): for building the app, never part of it.
 SKIP_DIRS = frozenset({
     ".git", ".github", "vendor", "scripts", "__pycache__", ".pytest_cache",
-    ".venv", "venv", "docs", ".ruff_cache", ".idea",
+    ".venv", "venv", "docs", ".ruff_cache", ".idea", ".claude",
 })
 SKIP_SUFFIXES = (".pyc", ".pyo", ".whl", ".tar.gz", ".zip", ".log")
 SKIP_NAMES = frozenset({

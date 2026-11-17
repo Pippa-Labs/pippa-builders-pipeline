@@ -119,6 +119,19 @@ def test_package_keeps_only_runtime_files(app):
     assert sorted(names) == sorted(package.files)
 
 
+def test_package_leaves_out_the_claude_code_settings(app):
+    """The templates ship .claude/settings.json: for building the app, never part of it."""
+    (app / ".claude").mkdir()
+    (app / ".claude" / "settings.json").write_text('{"permissions": {}}')
+    (app / ".claude" / "commands").mkdir()
+    (app / ".claude" / "commands" / "publish.md").write_text("x")
+    (app / "lib" / ".claude").mkdir(parents=True)
+    (app / "lib" / ".claude" / "settings.local.json").write_text("{}")
+    files = hp.Packager(app).build().files
+    assert not [name for name in files if ".claude" in name.split("/")]
+    assert {"app.py", "manifest.yaml"} <= set(files)
+
+
 def test_package_skips_symlinks(app, tmp_path):
     secret = tmp_path / "secret.txt"
     secret.write_text("token")
