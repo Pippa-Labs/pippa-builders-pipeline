@@ -328,6 +328,67 @@ def test_bad_manifest_is_code_error(app):
     assert client.calls == []
 
 
+# ---- manifest.yaml is read only as a regular file of the repository ----
+#
+# The publish job holds the role's credentials and can request an OIDC token, and a YAML error
+# quotes the line it stopped at in the commit comment, so a link must never be followed.
+
+LINK_TARGET = "token: [the-line-of-the-link-target\n"
+
+
+def link_manifest(app, target):
+    (app / "manifest.yaml").unlink()
+    os.symlink(target, app / "manifest.yaml")
+
+
+def test_a_linked_manifest_is_refused_without_reading_its_target(app, tmp_path):
+    target = tmp_path / "elsewhere.yaml"
+    target.write_text(LINK_TARGET)
+    link_manifest(app, target)
+    with pytest.raises(hp.CodeError) as err:
+        hp.load_manifest(app)
+    assert str(err.value) == "ERROR: manifest.yaml must be a regular file in the repository, not a link or a folder."
+    assert "the-line-of-the-link-target" not in str(err.value)
+
+
+def test_a_dangling_link_is_refused_as_a_link(app, tmp_path):
+    link_manifest(app, tmp_path / "missing.yaml")
+    with pytest.raises(hp.CodeError, match="not a link or a folder"):
+        hp.load_manifest(app)
+
+
+def test_a_folder_named_manifest_yaml_is_refused(app):
+    (app / "manifest.yaml").unlink()
+    (app / "manifest.yaml").mkdir()
+    with pytest.raises(hp.CodeError, match="not a link or a folder"):
+        hp.load_manifest(app)
+
+
+def test_a_link_that_appears_after_the_first_look_is_still_not_followed(app, tmp_path, monkeypatch):
+    target = tmp_path / "elsewhere.yaml"
+    target.write_text(LINK_TARGET)
+    link_manifest(app, target)
+    monkeypatch.setattr(hp.Path, "is_symlink", lambda self: False)
+    with pytest.raises(hp.CodeError) as err:
+        hp.load_manifest(app)
+    assert str(err.value).startswith("ERROR: manifest.yaml could not be read:")
+    assert "the-line-of-the-link-target" not in str(err.value)
+
+
+def test_a_regular_manifest_is_still_read(app):
+    assert hp.load_manifest(app)["app"]["id"] == "hack.x"
+
+
+def test_a_linked_manifest_never_reaches_the_publisher(app, tmp_path):
+    target = tmp_path / "elsewhere.yaml"
+    target.write_text(MANIFEST)
+    link_manifest(app, target)
+    token = FakeToken()
+    run, client = make_run(app, token=token)
+    assert run.execute(hp.CheckState()).kind == "code"
+    assert client.calls == [] and token.audiences == []
+
+
 # ---- rendering ----
 
 def test_status_description_truncated_to_140():

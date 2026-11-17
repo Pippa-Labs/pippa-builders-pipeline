@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import re
+import stat
 import sys
 import time
 import urllib.error
@@ -547,11 +548,36 @@ class Packager:
         )
 
 
+MANIFEST_NOT_A_FILE = "ERROR: manifest.yaml must be a regular file in the repository, not a link or a folder."
+
+
+def read_regular_file(path: Path) -> str:
+    """The UTF-8 text of path, opened without following a link and only if it is a regular file.
+
+    The last check is made on the opened file itself, so a link or a folder put in its place
+    after an earlier look is still never read.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(path, flags), "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise CodeError(MANIFEST_NOT_A_FILE)
+        return handle.read().decode("utf-8")
+
+
 def load_manifest(root: Path) -> dict[str, Any]:
+    """Reads manifest.yaml, refusing a link or anything else that is not a regular file.
+
+    It runs in the job that holds the publish role's credentials, and a YAML error quotes the
+    line it stopped at in the commit comment, so it never reads what a link points at (the
+    Packager leaves links out as well).
+    """
     import yaml
 
+    path = root / "manifest.yaml"
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise CodeError(MANIFEST_NOT_A_FILE)
     try:
-        manifest = yaml.safe_load((root / "manifest.yaml").read_text(encoding="utf-8"))
+        manifest = yaml.safe_load(read_regular_file(path))
     except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
         raise CodeError(f"ERROR: manifest.yaml could not be read: {exc}") from exc
     if not isinstance(manifest, dict):
