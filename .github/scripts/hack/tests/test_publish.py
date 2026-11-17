@@ -911,6 +911,76 @@ def test_the_publishers_own_event_refusal_is_recognised_by_its_sentence(app):
     assert "Push a commit to main to publish." in outcome.comment_payload()["body"]
 
 
+#: The publisher's own refusals of the run, as it answers them (hackathon/publisher/handler.py): its
+#: sentence, `error_kind` (none for the visibility refusal, a plain `Refused`) and `reason`.
+PUBLISHER_REFUSALS = {
+    "stale_run": ("This workflow run is older than the one that published the live version of this app, so it "
+                  "cannot replace it. Re-running an old run never publishes; push a new commit to main instead.",
+                  "refused"),
+    "rerun_untagged": ("This is a re-run of an earlier workflow run, and Pippa cannot tell whether it is older than "
+                       "the live version of this app, so it cannot replace it. Push a new commit to main instead.",
+                       "refused"),
+    "visibility_not_allowed": ("this repository is not private, so it cannot publish through the private pipeline; "
+                               "restore .github/workflows/publish.yml from the public template", None),
+    "concurrent_publish": ("Another publish of this app is running at the same time, so this one stopped and "
+                           "published nothing. Wait for that run to finish, then push again.", "refused"),
+}
+#: What each of them tells the builder to do next.
+PUBLISHER_NEXT_STEPS = {
+    "stale_run": "Push a new commit to main to publish your latest code.",
+    "rerun_untagged": "Push a new commit to main to publish. Re-running this run will not help;",
+    "visibility_not_allowed": "Restore .github/workflows/publish.yml from the public app template",
+    "concurrent_publish": "Wait for the other publish of this app to finish",
+}
+
+
+def publisher_refusal(reason, with_reason=True):
+    sentence, kind = PUBLISHER_REFUSALS[reason]
+    reply = {"statusCode": 403, "ok": False, "error_class": "code", "error": sentence}
+    if kind:
+        reply["error_kind"] = kind
+    if with_reason:
+        reply["reason"] = reason
+    return reply
+
+
+@pytest.mark.parametrize("reason", sorted(PUBLISHER_REFUSALS))
+def test_the_publishers_own_refusals_of_the_run_name_the_next_step(app, reason):
+    run, _ = make_run(app, FakeClient(json.dumps(publisher_refusal(reason)).encode()))
+    outcome = run.execute(hp.CheckState())
+    assert outcome.kind == "refused" and outcome.reason == reason
+    body = outcome.comment_payload()["body"]
+    assert f"```text\n{PUBLISHER_REFUSALS[reason][0]}\n```" in body
+    assert PUBLISHER_NEXT_STEPS[reason] in body
+    assert f"(Reason: {reason})" in body
+    assert hp.REFUSED_NEXT_STEP not in body and "CODE_ERROR" not in body
+
+
+@pytest.mark.parametrize("reason", sorted(PUBLISHER_REFUSALS))
+def test_the_publishers_own_refusals_are_recognised_by_their_sentence_alone(app, reason):
+    """A publisher from before it sent these reasons (concurrent_publish came without one)."""
+    reply = publisher_refusal(reason, with_reason=False)
+    assert hp.identity_reason(reply) == reason
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    outcome = run.execute(hp.CheckState())
+    assert outcome.kind == "refused" and outcome.reason == reason
+    assert PUBLISHER_NEXT_STEPS[reason] in outcome.comment_payload()["body"]
+
+
+@pytest.mark.parametrize("reason", sorted(PUBLISHER_REFUSALS))
+def test_the_built_in_sentence_is_the_publishers(reason):
+    assert hp.IDENTITY_REFUSALS[reason].sentence == PUBLISHER_REFUSALS[reason][0]
+
+
+def test_an_untagged_re_run_from_an_older_publisher_still_says_push_a_new_commit(app):
+    """A publisher that predates rerun_untagged sends stale_run with the untagged sentence."""
+    reply = {**publisher_refusal("rerun_untagged"), "reason": "stale_run"}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    outcome = run.execute(hp.CheckState())
+    assert outcome.reason == "stale_run"
+    assert "Push a new commit to main" in outcome.comment_payload()["body"]
+
+
 @pytest.mark.parametrize("reply", [
     {"statusCode": 500, "ok": False, "error_class": "infra", "error": ACTOR_SENTENCE, "reason": "actor_not_builder",
      "reference": "pub-1"},

@@ -96,7 +96,9 @@ class IdentityRefusal:
 
 
 #: The `reason` of a refusal about who or what started the run rather than the app (the runtime's
-#: pre-check, relayed by the publisher). The sentence stands in when Pippa sends none.
+#: pre-check, relayed by the publisher, or the publisher's own: an old run, a re-run Pippa cannot
+#: date, the wrong pipeline for the repository, two publishes at once). The sentence stands in
+#: when Pippa sends none; the publisher's own are its sentences in hackathon/publisher/handler.py.
 IDENTITY_REFUSALS = {
     "actor_not_builder": IdentityRefusal(
         "Only the builder this repository belongs to can publish it.",
@@ -115,16 +117,46 @@ IDENTITY_REFUSALS = {
         "Pippa does not know yet which GitHub account this repository belongs to, so it cannot check who pushed.",
         "Ask an organiser to finish setting up this repository. Changing the code will not help.",
     ),
+    "stale_run": IdentityRefusal(
+        "This workflow run is older than the one that published the live version of this app, so it cannot "
+        "replace it. Re-running an old run never publishes; push a new commit to main instead.",
+        "Push a new commit to main to publish your latest code. Re-running this run, or any older one, will "
+        "not publish it.",
+    ),
+    "rerun_untagged": IdentityRefusal(
+        "This is a re-run of an earlier workflow run, and Pippa cannot tell whether it is older than the live "
+        "version of this app, so it cannot replace it. Push a new commit to main instead.",
+        "Push a new commit to main to publish. Re-running this run will not help; once a push has published, "
+        "re-running that push's run works again.",
+    ),
+    "visibility_not_allowed": IdentityRefusal(
+        "this repository is not private, so it cannot publish through the private pipeline; restore "
+        ".github/workflows/publish.yml from the public template",
+        "Restore .github/workflows/publish.yml from the public app template (pippa-hack-template-public), "
+        "then push again. If you did not change that file, tell an organiser.",
+    ),
+    "concurrent_publish": IdentityRefusal(
+        "Another publish of this app is running at the same time, so this one stopped and published nothing. "
+        "Wait for that run to finish, then push again.",
+        "Wait for the other publish of this app to finish (see the Actions tab of this repository). If it did "
+        "not publish your latest commit, push again.",
+    ),
 }
-#: How each identity refusal's sentence starts. The publisher relays the runtime's sentence as
-#: `error` and does not send the `reason`, so this is how a refusal is recognised today. The
-#: runtime's sentences live in pippa_agentapp_runtime/deploys.py; the event refusal is also
-#: the publisher's own. Compared after curly apostrophes are made straight.
+#: How each identity refusal's sentence starts, for a publisher that sends the sentence as `error`
+#: without the `reason` (it sends `reason` for its identity refusals, `rerun_untagged` and
+#: `concurrent_publish` since they were added; before that, the runtime's refusals and an
+#: overlapping publish came without one). The runtime's sentences live in
+#: pippa_agentapp_runtime/deploys.py; the event refusal and the last four are the publisher's own,
+#: in hackathon/publisher/handler.py. Compared after curly apostrophes are made straight.
 IDENTITY_SENTENCES = (
     ("Only the builder this repository belongs to can publish it", "actor_not_builder"),
     ("Only a push to main publishes", "not_a_push"),
     ("This publish used a GitHub sign-in token that had already been used", "token_replayed"),
     ("Pippa doesn't know which GitHub account this repository belongs to", "builder_identity_unknown"),
+    ("This workflow run is older than the one that published the live version of this app", "stale_run"),
+    ("This is a re-run of an earlier workflow run, and Pippa cannot tell whether it is older", "rerun_untagged"),
+    ("this repository is not private, so it cannot publish through the private pipeline", "visibility_not_allowed"),
+    ("Another publish of this app is running at the same time", "concurrent_publish"),
 )
 CURLY_APOSTROPHE = "\N{RIGHT SINGLE QUOTATION MARK}"
 #: A runtime warning about an API key the app declares but its builder has not added yet, e.g.
