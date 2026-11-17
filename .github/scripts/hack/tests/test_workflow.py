@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from conftest import REPO
+from workflow_expressions import Status, runs
 
 WORKFLOW = REPO / ".github" / "workflows" / "reusable-hack-publish.yml"
 OWN_PREFIX = "Pippa-Labs/pippa-builders-pipeline/.github/actions/"
@@ -123,12 +124,13 @@ def test_the_sdk_reaches_the_check_job_as_a_cache_entry_of_this_run_never_an_art
 def test_check_job_order_installs_the_sdk_before_any_app_code(workflow):
     assert step_names(workflow, "check") == ["actions/checkout", "actions/setup-python", "actions/cache/restore",
                                              "sdk-install", "check", "verdict"]
-    assert workflow["jobs"]["check"]["if"] == "needs.sdk.result == 'success'"
+    assert workflow["jobs"]["check"]["if"] == "needs.sdk.result == 'success' && github.triggering_actor == github.actor"
 
 
 def test_the_sdk_job_runs_only_when_prepare_found_something_to_publish(workflow):
     assert workflow["jobs"]["sdk"]["if"] == (
-        "needs.prepare.outputs.ready == 'true' && needs.prepare.outputs.verdict != 'failed'"
+        "needs.prepare.outputs.ready == 'true' && needs.prepare.outputs.verdict != 'failed' "
+        "&& github.triggering_actor == github.actor"
     )
 
 
@@ -259,3 +261,70 @@ def test_a_rerun_by_another_account_does_not_publish(workflow):
     env = workflow["jobs"]["skipped"]["steps"][0]["env"]
     assert env["ACTOR"] == "${{ github.actor }}"
     assert env["TRIGGERING_ACTOR"] == "${{ github.triggering_actor }}"
+
+
+# ---- re-runs: GitHub evaluates only the conditions of the jobs it runs again ----
+#
+# "Re-run failed jobs" and "Re-run this job" keep the results and outputs of the jobs that are not
+# run again, so every job, and the step that assumes the publish role, checks who started the run.
+
+PUSHER = "tide-watcher"
+PUSH = {
+    "github.event_name": "push", "github.ref": "refs/heads/main", "github.repository_owner": "Pippa-Labs",
+    "github.event.repository.name": "pippa-hack-tides", "github.event.repository.fork": False,
+    "github.repository": "Pippa-Labs/pippa-hack-tides", "github.actor": PUSHER, "github.triggering_actor": PUSHER,
+}
+#: What the first attempt left when every job passed; a re-run of one job keeps the others'.
+PASSED = {
+    "needs.prepare.result": "success", "needs.prepare.outputs.ready": "true", "needs.prepare.outputs.verdict": "",
+    "needs.sdk.result": "success", "needs.check.result": "success", "needs.check.outputs.verdict": "passed",
+}
+#: What the first attempt left when the check job failed without a verdict (a platform error).
+CHECK_BROKE = {**PASSED, "needs.check.result": "failure", "needs.check.outputs.verdict": ""}
+NEEDS = {"prepare": (), "sdk": ("prepare",), "check": ("prepare", "sdk"), "publish": ("prepare", "sdk", "check")}
+
+
+def started_by(account, first_attempt=PASSED):
+    return {**PUSH, **first_attempt, "github.triggering_actor": account}
+
+
+def job_runs(workflow, name, context):
+    return runs(workflow["jobs"][name]["if"],
+                context, Status.of(*(context[f"needs.{need}.result"] for need in NEEDS[name])))
+
+
+def role_step_runs(workflow, context):
+    aws = next(step for step in steps(workflow, "publish") if step.get("id") == "aws")
+    return runs(aws["if"], context, Status.of(*(context[f"needs.{need}.result"] for need in NEEDS["publish"])))
+
+
+def test_a_push_by_the_builder_runs_every_job_and_assumes_the_role(workflow):
+    context = started_by(PUSHER)
+    assert [name for name in NEEDS if job_runs(workflow, name, context)] == list(NEEDS)
+    assert role_step_runs(workflow, context)
+    assert not runs(workflow["jobs"]["skipped"]["if"], context)
+
+
+@pytest.mark.parametrize("name", list(NEEDS))
+def test_a_rerun_of_any_one_job_by_another_account_runs_nothing(workflow, name):
+    assert not job_runs(workflow, name, started_by("org-writer"))
+    assert job_runs(workflow, name, started_by(PUSHER)), "the pusher may re-run it"
+
+
+def test_a_rerun_by_another_account_never_assumes_the_publish_role(workflow):
+    for first_attempt in (PASSED, CHECK_BROKE):
+        assert not role_step_runs(workflow, started_by("org-writer", first_attempt))
+        assert role_step_runs(workflow, started_by(PUSHER, first_attempt))
+
+
+def test_rerun_failed_jobs_by_another_account_after_a_platform_error_publishes_nothing(workflow):
+    context = started_by("org-writer", CHECK_BROKE)
+    assert not job_runs(workflow, "check", context)
+    assert not job_runs(workflow, "publish", context)
+
+
+def test_every_job_that_can_request_a_token_or_runs_app_code_checks_who_started_the_run(workflow):
+    for name in ("sdk", "check", "publish"):
+        assert "github.triggering_actor == github.actor" in workflow["jobs"][name]["if"], name
+    aws = next(step for step in steps(workflow, "publish") if step.get("id") == "aws")
+    assert "github.triggering_actor == github.actor" in aws["if"]

@@ -22,7 +22,9 @@ concurrency:
 # Only a push to main of a Pippa-Labs pippa-hack-* repository publishes: never another event,
 # branch, owner or repository, a fork, or one of the two templates; and a re-run only when the
 # account that pushed starts it (a re-run keeps the pusher as `actor`, and so in the token). The
-# `skipped` job says why in the run summary when this does not hold.
+# `skipped` job says why in the run summary when this does not hold. "Re-run failed jobs" and
+# "Re-run this job" keep the results of the jobs they do not run again, so every job, and the
+# step that assumes the publish role, checks who started the run itself.
 #
 # App code runs only in the check job, which has no credentials and no `id-token`. The SDK job
 # fetches the Pippa SDK with the SDK read role and hands the wheel over as a cache entry of this
@@ -74,7 +76,7 @@ jobs:
   sdk:
     name: Fetch the Pippa SDK
     needs: prepare
-    if: needs.prepare.outputs.ready == 'true' && needs.prepare.outputs.verdict != 'failed'
+    if: needs.prepare.outputs.ready == 'true' && needs.prepare.outputs.verdict != 'failed' && github.triggering_actor == github.actor
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -109,7 +111,7 @@ jobs:
   check:
     name: Check
     needs: [prepare, sdk]
-    if: needs.sdk.result == 'success'
+    if: needs.sdk.result == 'success' && github.triggering_actor == github.actor
     runs-on: ubuntu-latest
     timeout-minutes: 12
     permissions:
@@ -163,7 +165,7 @@ jobs:
   publish:
     name: Publish
     needs: [prepare, sdk, check]
-    if: ${{ !cancelled() && needs.prepare.result != 'skipped' && needs.prepare.outputs.ready != 'false' }}
+    if: ${{ !cancelled() && needs.prepare.result != 'skipped' && needs.prepare.outputs.ready != 'false' && github.triggering_actor == github.actor }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: pippa-publish
@@ -199,7 +201,7 @@ jobs:
       # Also after a job that failed without a verdict (platform error), so the error is counted.
       - name: Get permission to publish
         id: aws
-        if: ${{ !cancelled() && (needs.check.result == 'success' || needs.sdk.result == 'failure' || (needs.prepare.result == 'failure' && needs.prepare.outputs.verdict != 'failed') || (needs.check.result == 'failure' && needs.check.outputs.verdict != 'failed')) }}
+        if: ${{ !cancelled() && (needs.check.result == 'success' || needs.sdk.result == 'failure' || (needs.prepare.result == 'failure' && needs.prepare.outputs.verdict != 'failed') || (needs.check.result == 'failure' && needs.check.outputs.verdict != 'failed')) && github.triggering_actor == github.actor }}
         continue-on-error: true
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
