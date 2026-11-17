@@ -248,7 +248,7 @@ def test_fetch_sdk_downloads_only_from_the_sdk_repository_with_pin_and_hash(tmp_
     assert pip.startswith("pip download ")
     assert "--index-url https://aws:tok-secret-value@pippa-780886633355.d.codeartifact.eu-west-2.amazonaws.com" \
            "/pypi/pippa-prod-codeartifact-euw2-hack-sdk/simple/" in pip
-    assert f"--dest {tmp_path / 'runner' / HANDOVER}" in pip
+    assert f"--dest {tmp_path / 'runner' / 'hack-sdk' / 'sdk'}" in pip
     assert "extra-index-url" not in pip
     for flag in ("--no-deps", "--require-hashes", "--only-binary :all:", "--no-cache-dir"):
         assert flag in pip
@@ -259,15 +259,61 @@ def test_fetch_sdk_downloads_only_from_the_sdk_repository_with_pin_and_hash(tmp_
     assert f"CWD={tmp_path / 'runner' / 'hack-sdk'}" in calls
 
 
-def test_fetch_sdk_hands_over_the_pin_and_one_wheel_and_nothing_else(tmp_path, bin_dir):
+SEALED = "sdk.tar.enc"
+WHEEL = "pippa_agentapp_sdk-0.1.3-py3-none-any.whl"
+
+
+def handover_key(output: str) -> str:
+    return next(line.split("=", 1)[1] for line in output.splitlines() if line.startswith("handover_key="))
+
+
+def unseal(sealed, key) -> subprocess.CompletedProcess:
+    """Opens a sealed hand-over as the check job does; returns the tar archive as bytes."""
+    return subprocess.run(["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2", "-md", "sha256",
+                           "-pass", f"pass:{key}", "-in", str(sealed)], capture_output=True)
+
+
+def tar_names(archive: bytes) -> list[str]:
+    listing = subprocess.run(["tar", "-tf", "-"], input=archive, capture_output=True, check=True).stdout
+    return sorted(listing.decode().split())
+
+
+def test_fetch_sdk_hands_over_only_the_sealed_pin_and_wheel_and_the_key_as_an_output(tmp_path, bin_dir):
     result, _ = run_fetch(tmp_path, bin_dir)
     assert result.returncode == 0, result.stderr
     handover = tmp_path / "runner" / HANDOVER
-    assert sorted(path.name for path in handover.iterdir()) == ["pippa_agentapp_sdk-0.1.3-py3-none-any.whl", "sdk.txt"]
-    assert (handover / "sdk.txt").read_text() == f"pippa-agentapp-sdk==0.1.3 --hash=sha256:{SHA}\n"
-    assert not (tmp_path / "runner" / "hack-sdk").exists()
+    assert [path.name for path in handover.iterdir()] == [SEALED]
+    sealed = (handover / SEALED).read_bytes()
+    for clear in (b"pippa-agentapp-sdk==", WHEEL.encode(), b"tok-secret-value", b"ustar"):
+        assert clear not in sealed, clear
+    assert not (tmp_path / "runner" / "hack-sdk").exists(), "nothing in the clear is left behind"
     assert list((tmp_path / "home").iterdir()) == []
-    assert "tok-secret-value" not in "".join(path.read_text(errors="replace") for path in handover.iterdir())
+
+    key = handover_key(read(tmp_path / "output.txt"))
+    assert len(key) == 64 and set(key) <= set("0123456789abcdef")
+    opened = unseal(handover / SEALED, key)
+    assert opened.returncode == 0, opened.stderr
+    assert tar_names(opened.stdout) == [WHEEL, "sdk.txt"]
+    assert key not in result.stdout + result.stderr, "the key is never printed"
+
+
+def test_the_hand_over_does_not_open_without_this_runs_key(tmp_path, bin_dir):
+    run_fetch(tmp_path, bin_dir)
+    key = handover_key(read(tmp_path / "output.txt"))
+    other = ("0" if key[0] != "0" else "1") + key[1:]
+    opened = unseal(tmp_path / "runner" / HANDOVER / SEALED, other)
+    assert opened.returncode != 0 or b"sdk.txt" not in opened.stdout
+
+
+def test_every_run_seals_with_a_key_of_its_own(tmp_path, bin_dir):
+    keys = []
+    for attempt in ("first", "second"):
+        directory = tmp_path / attempt
+        directory.mkdir()
+        shutil.copytree(bin_dir, directory / "bin")
+        run_fetch(directory, directory / "bin")
+        keys.append(handover_key(read(directory / "output.txt")))
+    assert keys[0] != keys[1]
 
 
 PLANTED_PIP = "open({marker!r}, 'w').write('planted pip ran')\n"
@@ -343,17 +389,35 @@ def test_fetch_sdk_without_a_wheel_fails(tmp_path, bin_dir):
 # ---- install-sdk (the check job) ----
 
 PIN = f"pippa-agentapp-sdk==0.1.3 --hash=sha256:{SHA}\n"
+KEY = "0123456789abcdef" * 4
+INSTALL_DIR = "hack-sdk-install"
 
 
-def run_install(tmp_path, bin_dir, pin=PIN, wheel=True, **extra):
+def seal(handover, files, key=KEY):
+    """Writes a sealed hand-over as the SDK job does: a tar archive of `files`, encrypted with `key`."""
+    plain = handover.parent / "plain"
+    plain.mkdir()
+    for name, data in files.items():
+        (plain / name).parent.mkdir(parents=True, exist_ok=True)
+        (plain / name).write_bytes(data)
+    archive = subprocess.run(["tar", "-C", str(plain), "-cf", "-", *files], capture_output=True, check=True).stdout
+    subprocess.run(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-md", "sha256", "-salt", "-pass", f"pass:{key}",
+                    "-out", str(handover / SEALED)], input=archive, check=True)
+    shutil.rmtree(plain)
+
+
+def run_install(tmp_path, bin_dir, pin=PIN, wheel=True, files=None, key=KEY, sealed_with=KEY, **extra):
     app = make_app(tmp_path)
     handover = tmp_path / "runner" / HANDOVER
     handover.mkdir(parents=True)
-    if pin is not None:
-        (handover / "sdk.txt").write_text(pin)
-    if wheel:
-        (handover / "pippa_agentapp_sdk-0.1.3-py3-none-any.whl").write_bytes(b"PK")
-    env = {"STUB_PIP": "1", "PIP_EXTRA_INDEX_URL": "https://evil.example/simple"}
+    if files is None:
+        files = {}
+        if pin is not None:
+            files["sdk.txt"] = pin.encode()
+        if wheel:
+            files[WHEEL] = b"PK"
+    seal(handover, files, sealed_with)
+    env = {"STUB_PIP": "1", "PIP_EXTRA_INDEX_URL": "https://evil.example/simple", "HANDOVER_KEY": key}
     env.update(extra)
     result, _, _ = run_check_script(tmp_path, bin_dir, app, "install-sdk.sh", **env)
     return result, read(tmp_path / "calls.log"), handover
@@ -364,16 +428,64 @@ def test_install_sdk_installs_the_handed_over_wheel_offline_with_its_hash(tmp_pa
     assert result.returncode == 0, result.stderr
     pip = next(line for line in calls.splitlines() if line.startswith("pip "))
     assert pip.startswith("pip install ")
-    assert f"--no-index --find-links {handover}" in pip
+    install_dir = tmp_path / "runner" / INSTALL_DIR
+    assert f"--no-index --find-links {install_dir}" in pip
     for flag in ("--no-deps", "--require-hashes", "--only-binary :all:", "--no-cache-dir"):
         assert flag in pip
     assert "index-url" not in pip
     assert f"REQUIREMENTS {PIN.strip()}" in calls
     assert "PIP_CONFIG_FILE=/dev/null" in calls and "PIP_EXTRA_INDEX_URL=unset" in calls
     assert "FLAGS=-I" in calls
-    assert f"CWD={handover}" in calls
-    assert not handover.exists()
+    assert f"CWD={install_dir}" in calls
+    assert not handover.exists() and not install_dir.exists()
     assert "aws " not in calls
+
+
+def test_the_fetched_sdk_installs_with_the_key_the_sdk_job_wrote(tmp_path, bin_dir):
+    fetched, _ = run_fetch(tmp_path, bin_dir)
+    assert fetched.returncode == 0, fetched.stderr
+    key = handover_key(read(tmp_path / "output.txt"))
+    result, _, _ = run_check_script(tmp_path, bin_dir, tmp_path / "app", "install-sdk.sh", STUB_PIP="1",
+                                    HANDOVER_KEY=key)
+    assert result.returncode == 0, result.stderr
+    calls = read(tmp_path / "calls.log").splitlines()
+    install = next(index for index, line in enumerate(calls) if line.startswith("pip install "))
+    assert f"REQUIREMENTS {PIN.strip()}" in calls[install:]
+
+
+@pytest.mark.parametrize("key", ["", "not-a-key", "0" * 64])
+def test_install_sdk_refuses_without_this_runs_key(tmp_path, bin_dir, key):
+    result, calls, handover = run_install(tmp_path, bin_dir, key=key)
+    assert result.returncode == 1
+    assert "pip " not in calls
+    assert not handover.exists() and not (tmp_path / "runner" / INSTALL_DIR).exists()
+    assert KEY not in result.stdout + result.stderr
+
+
+def test_install_sdk_refuses_a_hand_over_in_the_clear(tmp_path, bin_dir):
+    app = make_app(tmp_path)
+    handover = tmp_path / "runner" / HANDOVER
+    handover.mkdir(parents=True)
+    (handover / "sdk.txt").write_text(PIN)
+    (handover / WHEEL).write_bytes(b"PK")
+    result, _, _ = run_check_script(tmp_path, bin_dir, app, "install-sdk.sh", STUB_PIP="1", HANDOVER_KEY=KEY)
+    assert result.returncode == 1
+    assert "pip " not in read(tmp_path / "calls.log")
+    assert "The SDK job handed over something other than the sealed SDK" in result.stderr
+    assert not handover.exists()
+
+
+@pytest.mark.parametrize("files", [
+    {"sdk.txt": PIN.encode(), WHEEL: b"PK", "extra.py": b"x"},
+    {"sdk.txt": PIN.encode(), WHEEL: b"PK", "pippa_agentapp_sdk-9.9.9-py3-none-any.whl": b"PK"},
+    {"sdk.txt": PIN.encode(), "sub/" + WHEEL: b"PK"},
+    {"sdk.txt": PIN.encode(), "evil-1.0-py3-none-any.whl": b"PK"},
+])
+def test_install_sdk_refuses_anything_but_the_pin_and_one_sdk_wheel_in_the_hand_over(tmp_path, bin_dir, files):
+    result, calls, handover = run_install(tmp_path, bin_dir, files=files)
+    assert result.returncode == 1
+    assert "pip " not in calls
+    assert not handover.exists() and not (tmp_path / "runner" / INSTALL_DIR).exists()
 
 
 @pytest.mark.parametrize("pin", [

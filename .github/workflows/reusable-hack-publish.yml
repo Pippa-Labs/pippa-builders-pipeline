@@ -28,7 +28,9 @@ concurrency:
 #
 # App code runs only in the check job, which has no credentials and no `id-token`. The SDK job
 # fetches the Pippa SDK with the SDK read role and hands the wheel over as a cache entry of this
-# run (an artifact of a public repository could be downloaded by anyone).
+# run (an artifact of a public repository could be downloaded by anyone). A pull request's run,
+# also from a fork, can restore the caches of main, so the entry is sealed with a key made for
+# this run, which reaches the check job only as the SDK job's output `handover_key`.
 jobs:
   # Runs no app code: personal data, committed keys, nothing to publish yet, dependencies.
   prepare:
@@ -81,6 +83,8 @@ jobs:
     timeout-minutes: 5
     permissions:
       id-token: write
+    outputs:
+      handover_key: ${{ steps.fetch.outputs.handover_key }}
     steps:
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -96,6 +100,7 @@ jobs:
           role-duration-seconds: 900
 
       - name: Fetch the Pippa SDK
+        id: fetch
         uses: Pippa-Labs/pippa-builders-pipeline/.github/actions/hack-check@main
         with:
           mode: sdk-fetch
@@ -143,6 +148,7 @@ jobs:
         uses: Pippa-Labs/pippa-builders-pipeline/.github/actions/hack-check@main
         with:
           mode: sdk-install
+          handover_key: ${{ needs.sdk.outputs.handover_key }}
           log_level: ${{ inputs.log_level }}
 
       - name: Check the app

@@ -121,6 +121,32 @@ def test_the_sdk_reaches_the_check_job_as_a_cache_entry_of_this_run_never_an_art
     assert "upload-artifact" not in WORKFLOW.read_text() and "download-artifact" not in WORKFLOW.read_text()
 
 
+def test_the_key_of_the_sealed_hand_over_goes_from_the_sdk_job_to_the_install_step_only(workflow):
+    # The cache entry can be restored by a pull request's run, also from a fork; the job output
+    # that carries the key cannot.
+    assert workflow["jobs"]["sdk"]["outputs"] == {"handover_key": "${{ steps.fetch.outputs.handover_key }}"}
+    fetch = next(step for step in steps(workflow, "sdk") if step.get("with", {}).get("mode") == "sdk-fetch")
+    assert fetch["id"] == "fetch"
+    for step in steps(workflow, "check"):
+        if step.get("with", {}).get("mode") == "sdk-install":
+            assert step["with"]["handover_key"] == "${{ needs.sdk.outputs.handover_key }}"
+        else:
+            assert "handover_key" not in yaml.safe_dump(step), step.get("name")
+    for job in ("prepare", "publish", "skipped"):
+        assert "handover_key" not in yaml.safe_dump(workflow["jobs"][job]), job
+
+
+def test_only_the_install_step_of_the_check_action_receives_the_key():
+    action = yaml.safe_load((REPO / ".github" / "actions" / "hack-check" / "action.yml").read_text())
+    assert action["outputs"]["handover_key"]["value"] == "${{ steps.fetch.outputs.handover_key }}"
+    with_key = [step["name"] for step in action["runs"]["steps"] if "inputs.handover_key" in yaml.safe_dump(step)]
+    assert with_key == ["Install the Pippa SDK"]
+    install = next(step for step in action["runs"]["steps"] if step["name"] == "Install the Pippa SDK")
+    assert install["env"]["HANDOVER_KEY"] == "${{ inputs.handover_key }}"
+    fetch = next(step for step in action["runs"]["steps"] if step["name"] == "Fetch the Pippa SDK")
+    assert fetch["id"] == "fetch"
+
+
 def test_check_job_order_installs_the_sdk_before_any_app_code(workflow):
     assert step_names(workflow, "check") == ["actions/checkout", "actions/setup-python", "actions/cache/restore",
                                              "sdk-install", "check", "verdict"]

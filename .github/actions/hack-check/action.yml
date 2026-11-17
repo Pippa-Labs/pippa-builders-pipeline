@@ -9,8 +9,15 @@ inputs:
     description: Global log level (DEBUG, INFO, WARN, ERROR)
     required: false
     default: INFO
+  handover_key:
+    description: Key of this run's sealed SDK hand-over, the SDK job's output (mode sdk-install only)
+    required: false
+    default: ""
 
 outputs:
+  handover_key:
+    description: Key that opens this run's sealed SDK hand-over (mode sdk-fetch)
+    value: ${{ steps.fetch.outputs.handover_key }}
   ready:
     description: false when there is nothing to publish yet (placeholder app id or blank app_author_name) and nothing was refused (mode prepare)
     value: ${{ steps.prepare.outputs.ready }}
@@ -36,16 +43,19 @@ runs:
       run: bash "${{ github.action_path }}/scripts/prepare.sh"
 
     - name: Fetch the Pippa SDK
+      id: fetch
       if: inputs.mode == 'sdk-fetch'
       shell: bash
       env:
         LOG_LEVEL: ${{ inputs.log_level }}
       run: bash "${{ github.action_path }}/scripts/fetch-sdk.sh"
 
+    # The only step that gets the key: the app's code runs in a later step of the same job.
     - name: Install the Pippa SDK
       if: inputs.mode == 'sdk-install'
       shell: bash
       env:
+        HANDOVER_KEY: ${{ inputs.handover_key }}
         LOG_LEVEL: ${{ inputs.log_level }}
       run: bash "${{ github.action_path }}/scripts/install-sdk.sh"
 
