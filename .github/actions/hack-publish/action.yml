@@ -53,6 +53,11 @@ inputs:
     description: Global log level (DEBUG, INFO, WARN, ERROR)
     required: false
     default: INFO
+  # Remove after 2026-12-20, with hack-check's modes sdk and clear.
+  old_workflow:
+    description: false from the current workflow. The workflow made before the check was split into the prepare, SDK and check jobs passes nothing (re-runs of its runs, until 2026-12-20); its check job can no longer pass, so a check that failed without a verdict is REFUSED (push a new commit), not a platform error
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -79,5 +84,6 @@ runs:
         DEPENDENCIES_OUTCOME: ${{ inputs.dependencies }}
         CREDENTIALS: ${{ inputs.credentials }}
         REPORT_TOKEN: ${{ inputs.token }}
+        OLD_WORKFLOW: ${{ inputs.old_workflow }}
         LOG_LEVEL: ${{ inputs.log_level }}
       run: bash "${{ github.action_path }}/hack-publish.sh"

@@ -1,9 +1,9 @@
 name: Hackathon app check
-description: Steps of the prepare, SDK and check jobs of the hackathon publish workflow, one per mode (prepare, sdk-fetch, sdk-install, check)
+description: Steps of the prepare, SDK and check jobs of the hackathon publish workflow, one per mode (prepare, sdk-fetch, sdk-install, check; sdk and clear for re-runs of the workflow before the split, until 2026-12-20)
 
 inputs:
   mode:
-    description: prepare (prepare job), sdk-fetch (SDK job), sdk-install or check (check job)
+    description: prepare (prepare job), sdk-fetch (SDK job), sdk-install or check (check job); sdk (refuses) and clear (blanks the AWS credentials) only for the check job of the workflow made before the split, remove after 2026-12-20
     required: true
   log_level:
     description: Global log level (DEBUG, INFO, WARN, ERROR)
@@ -66,3 +66,23 @@ runs:
       env:
         LOG_LEVEL: ${{ inputs.log_level }}
       run: bash "${{ github.action_path }}/scripts/check-app.sh"
+
+    # Remove after 2026-12-20: modes sdk and clear. The workflow made before the check was split
+    # into the prepare, SDK and check jobs ran prepare, sdk, clear and check in one job, and a
+    # re-run of single jobs of one of its runs (allowed for 30 days) replays it with this action
+    # @main. Without these steps both modes would do nothing: the SDK read role's credentials
+    # would stay in that job to its end, and only check-app.sh's own guard would keep the app's
+    # code from running next to them, reported as a platform error.
+    - name: Refuse the workflow made before the split (remove after 2026-12-20)
+      if: inputs.mode == 'sdk'
+      shell: bash
+      env:
+        LOG_LEVEL: ${{ inputs.log_level }}
+      run: bash "${{ github.action_path }}/scripts/refuse-old-workflow.sh"
+
+    - name: Remove the credentials (remove after 2026-12-20)
+      if: inputs.mode == 'clear'
+      shell: bash
+      env:
+        LOG_LEVEL: ${{ inputs.log_level }}
+      run: bash "${{ github.action_path }}/scripts/clear-credentials.sh"

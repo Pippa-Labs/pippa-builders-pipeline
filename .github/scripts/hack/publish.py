@@ -95,6 +95,14 @@ class IdentityRefusal:
     next_step: str
 
 
+#: A check that failed without a verdict in the workflow made before the check was split into the
+#: prepare, SDK and check jobs (--old-workflow). A re-run of single jobs of one of its runs replays
+#: it for 30 days with the actions of @main, and hack-check refuses its `sdk` mode, so its check job
+#: can no longer pass: a refusal that asks for a new push, not a platform error. The public
+#: pipeline's hack-publish passes --old-workflow unless the workflow says otherwise.
+#: Remove after 2026-12-20.
+OLD_WORKFLOW_REASON = "old_workflow"
+
 #: The `reason` of a refusal about who or what started the run rather than the app (the runtime's
 #: pre-check, relayed by the publisher, or the publisher's own: an old run, a re-run Pippa cannot
 #: date, the wrong pipeline for the repository, two publishes at once). The sentence stands in
@@ -140,6 +148,12 @@ IDENTITY_REFUSALS = {
         "Wait for that run to finish, then push again.",
         "Wait for the other publish of this app to finish (see the Actions tab of this repository). If it did "
         "not publish your latest commit, push again.",
+    ),
+    # Decided here, never sent by the publisher. Remove after 2026-12-20, with --old-workflow.
+    OLD_WORKFLOW_REASON: IdentityRefusal(
+        "This run was made by an older version of the Pippa publish workflow, which can no longer publish.",
+        "Push a new commit to main to publish your app. Re-running this run, or any run made before the "
+        "update, will not help.",
     ),
 }
 #: How each identity refusal's sentence starts, for a publisher that sends the sentence as `error`
@@ -472,12 +486,20 @@ class OutcomeFactory:
     def platform(self, reference: str | None = None) -> PlatformFailure:
         return PlatformFailure(self.run_url, reference or self.reference)
 
-    def from_check(self, result: str, verdict: str, details: str) -> Outcome | None:
-        """Returns the outcome decided by the check job, or None when publishing may go on."""
+    def from_check(self, result: str, verdict: str, details: str, old_workflow: bool = False) -> Outcome | None:
+        """Returns the outcome decided by the check job, or None when publishing may go on.
+
+        With `old_workflow`, a check that failed without a verdict is the old workflow's check job
+        that can no longer pass (OLD_WORKFLOW_REASON): refused, not a platform error.
+        """
         if result == "success":
             return None
         if result == "failure" and verdict == "failed":
             return self.code(details)
+        if result == "failure" and old_workflow:
+            LOG.warning("Check job of the workflow made before the split failed (verdict=%r); push a new commit",
+                        verdict)
+            return self.refused("", OLD_WORKFLOW_REASON)
         LOG.error("Check job ended with result=%r verdict=%r", result, verdict)
         return self.platform()
 
@@ -747,6 +769,8 @@ class CheckState:
     details: str = ""
     credentials: str = "success"
     setup: str = "success"
+    #: The calling workflow is the one made before the check was split (remove after 2026-12-20).
+    old_workflow: bool = False
 
 
 class PublishRun:
@@ -765,7 +789,7 @@ class PublishRun:
         self.publisher_factory = publisher_factory
 
     def execute(self, state: CheckState) -> Outcome:
-        decided = self.factory.from_check(state.result, state.verdict, state.details)
+        decided = self.factory.from_check(state.result, state.verdict, state.details, state.old_workflow)
         if decided is not None:
             return decided
         try:
@@ -833,6 +857,8 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--check-warnings-file", default="", help="Non-blocking warnings of a passed check")
     parser.add_argument("--credentials", default="success")
     parser.add_argument("--setup", default="success", help="Aggregated outcome of checkout, Python and dependencies")
+    parser.add_argument("--old-workflow", action="store_true",
+                        help="The workflow made before the check was split (remove after 2026-12-20)")
     return parser.parse_args(argv)
 
 
@@ -849,6 +875,7 @@ def main(argv: list[str] | None = None) -> int:
         details=read_details(args.check_details_file),
         credentials=args.credentials,
         setup=args.setup,
+        old_workflow=args.old_workflow,
     )
     run = PublishRun(
         app_dir=args.app_dir,

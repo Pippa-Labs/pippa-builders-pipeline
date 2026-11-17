@@ -508,6 +508,67 @@ def test_install_sdk_pip_failure_fails_and_cleans_up(tmp_path, bin_dir):
     assert not handover.exists()
 
 
+# ---- modes sdk and clear: the check job of the workflow made before the split (remove after 2026-12-20) ----
+
+#: The modes the check job of the workflow made before the split calls, in its order. A re-run of
+#: single jobs of one of its runs replays it with this action @main for 30 days.
+OLD_WORKFLOW_MODES = ("prepare", "sdk", "clear", "check")
+
+
+def action_steps():
+    return yaml.safe_load((CHECK_ACTION_DIR / "action.yml").read_text())["runs"]["steps"]
+
+
+@pytest.mark.parametrize("mode", OLD_WORKFLOW_MODES)
+def test_every_mode_the_old_workflow_calls_still_runs_a_step(mode):
+    """A mode without a step does nothing and succeeds: `clear` would leave the credentials in the job."""
+    assert [step["name"] for step in action_steps() if step.get("if") == f"inputs.mode == '{mode}'"]
+
+
+@pytest.mark.parametrize("mode, script", [("sdk", "refuse-old-workflow.sh"), ("clear", "clear-credentials.sh")])
+def test_the_old_workflows_modes_run_their_script_and_say_when_they_go(mode, script):
+    step = next(step for step in action_steps() if step.get("if") == f"inputs.mode == '{mode}'")
+    assert step["run"] == f'bash "${{{{ github.action_path }}}}/scripts/{script}"'
+    assert "remove after 2026-12-20" in step["name"]
+    assert "Remove after 2026-12-20" in (CHECK_ACTION_DIR / "scripts" / script).read_text()
+
+
+def test_the_old_workflows_sdk_mode_refuses_and_tells_the_builder_to_push(tmp_path, bin_dir):
+    app = make_app(tmp_path)
+    result, output, summary = run_check_script(tmp_path, bin_dir, app, "refuse-old-workflow.sh",
+                                               AWS_SESSION_TOKEN="sdk-role-session")
+    assert result.returncode == 1
+    message = ("Not published: this run was made by an older version of the Pippa publish workflow, which can no "
+               "longer publish, so re-running it will not help. Push a new commit to main to publish your app.")
+    assert f"::error title=Push a new commit to publish::{message}\n" in result.stdout
+    assert message in summary
+    assert "platform" not in (result.stdout + result.stderr).lower()
+    assert "verdict" not in output, "no verdict: the check job's outputs stay as prepare left them"
+    assert read(tmp_path / "calls.log") == "", "nothing installed, nothing fetched"
+
+
+def test_the_old_workflows_clear_mode_blanks_the_credentials_and_the_sdk_leftovers(tmp_path, bin_dir):
+    app = make_app(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir()
+    pip_conf = home / ".config" / "pip" / "pip.conf"
+    pip_conf.parent.mkdir(parents=True)
+    pip_conf.write_text("[global]\nindex-url = https://aws:tok@pippa.d.codeartifact.eu-west-2.amazonaws.com/x/\n")
+    other_conf = home / ".pip" / "pip.conf"
+    other_conf.parent.mkdir(parents=True)
+    other_conf.write_text("[global]\ntimeout = 30\n")
+    leftover = tmp_path / "runner" / "hack-sdk"
+    leftover.mkdir(parents=True)
+    (leftover / "sdk.txt").write_text("x")
+    result, _, _ = run_check_script(tmp_path, bin_dir, app, "clear-credentials.sh",
+                                    AWS_SESSION_TOKEN="sdk-role-session")
+    assert result.returncode == 0, result.stderr
+    assert read(tmp_path / "env.txt") == (
+        "AWS_ACCESS_KEY_ID=\nAWS_SECRET_ACCESS_KEY=\nAWS_SESSION_TOKEN=\nAWS_SECURITY_TOKEN=\n")
+    assert not pip_conf.exists() and not leftover.exists()
+    assert other_conf.exists(), "a pip config without the SDK repository is left alone"
+
+
 # ---- check-app ----
 
 def test_check_passing(tmp_path, bin_dir):
@@ -699,6 +760,48 @@ def test_publish_check_platform_failure_is_infra_with_metric(tmp_path, bin_dir):
     assert result.returncode == 1
     assert "aws cloudwatch put-metric-data --namespace Pippa/Hackathon --metric-name InfraErrors --value 1" in calls
     assert posted(calls, "/commits/abc123/comments")["body"].startswith("PLATFORM_ERROR")
+
+
+def test_publish_of_the_old_workflow_reports_its_failed_check_as_refused_without_a_metric(tmp_path, bin_dir):
+    """The workflow made before the split: hack-check refused its mode sdk, so the check job failed
+    without a verdict. The builder is told to push a new commit, and no platform error is counted."""
+    make_app(tmp_path)
+    result, calls = run_publish(tmp_path, bin_dir, CHECK_RESULT="failure", CHECK_VERDICT="", OLD_WORKFLOW="true",
+                                CHECKOUT_OUTCOME="skipped", DEPENDENCIES_OUTCOME="skipped")
+    assert result.returncode == 1
+    assert "aws " not in calls, "no InfraErrors"
+    body = posted(calls, "/commits/abc123/comments")["body"]
+    assert body.startswith("REFUSED: the app was not published:")
+    assert "Push a new commit to main to publish your app." in body and "(Reason: old_workflow)" in body
+    assert posted(calls, "/statuses/abc123")["description"].startswith(
+        "Refused: This run was made by an older version of the Pippa publish workflow")
+    assert read(tmp_path / "runner" / "hack-publish" / "outcome") == "refused"
+
+
+def test_publish_of_the_old_workflow_still_reports_a_failed_check_as_code(tmp_path, bin_dir):
+    make_app(tmp_path)
+    result, calls = run_publish(tmp_path, bin_dir, CHECK_RESULT="failure", CHECK_VERDICT="failed",
+                                CHECK_DETAILS=" FAIL personal data", OLD_WORKFLOW="true", CHECKOUT_OUTCOME="skipped",
+                                DEPENDENCIES_OUTCOME="skipped", CREDENTIALS="skipped")
+    assert result.returncode == 1
+    assert posted(calls, "/commits/abc123/comments")["body"].startswith("CODE_ERROR")
+
+
+def test_publish_of_the_current_workflow_counts_a_check_without_verdict(tmp_path, bin_dir):
+    make_app(tmp_path)
+    result, calls = run_publish(tmp_path, bin_dir, CHECK_RESULT="failure", CHECK_VERDICT="", OLD_WORKFLOW="false",
+                                CHECKOUT_OUTCOME="skipped", DEPENDENCIES_OUTCOME="skipped")
+    assert result.returncode == 1
+    assert "aws cloudwatch put-metric-data --namespace Pippa/Hackathon --metric-name InfraErrors --value 1" in calls
+    assert posted(calls, "/commits/abc123/comments")["body"].startswith("PLATFORM_ERROR")
+
+
+def test_the_publish_action_takes_a_missing_old_workflow_input_as_the_old_workflow():
+    """The old workflow cannot pass the input, so its absence is what marks it."""
+    action = yaml.safe_load((PUBLISH_ACTION_DIR / "action.yml").read_text())
+    assert action["inputs"]["old_workflow"]["default"] == "true"
+    publish = next(step for step in action["runs"]["steps"] if step.get("if") == "inputs.mode == 'publish'")
+    assert publish["env"]["OLD_WORKFLOW"] == "${{ inputs.old_workflow }}"
 
 
 def test_publish_setup_failure_is_infra_with_metric(tmp_path, bin_dir):

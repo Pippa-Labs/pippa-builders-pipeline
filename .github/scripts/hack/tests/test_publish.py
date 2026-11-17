@@ -322,6 +322,53 @@ def test_check_job_failure_without_verdict_is_infra(app):
     assert client.calls == []
 
 
+OLD_WORKFLOW_SENTENCE = ("This run was made by an older version of the Pippa publish workflow, which can no "
+                         "longer publish.")
+
+
+@pytest.mark.parametrize("verdict", ["", "passed"])
+def test_the_old_workflows_failed_check_is_refused_not_a_platform_error(app, verdict):
+    """A re-run of a run made before the check was split: its check job can no longer pass."""
+    run, client = make_run(app)
+    outcome = run.execute(hp.CheckState(result="failure", verdict=verdict, old_workflow=True))
+    assert outcome.kind == "refused" and outcome.reason == "old_workflow"
+    body = outcome.comment_payload()["body"]
+    assert body.startswith(f"REFUSED: the app was not published:\n\n```text\n{OLD_WORKFLOW_SENTENCE}\n```")
+    assert "Push a new commit to main to publish your app." in body
+    assert "PLATFORM_ERROR" not in body and "CODE_ERROR" not in body
+    assert outcome.status_payload()["description"] == f"Refused: {OLD_WORKFLOW_SENTENCE}"
+    assert client.calls == []
+
+
+def test_the_old_workflows_refusal_by_prepare_stays_a_code_error(app):
+    run, client = make_run(app)
+    outcome = run.execute(hp.CheckState(result="failure", verdict="failed", details=" FAIL x", old_workflow=True))
+    assert outcome.kind == "code"
+    assert client.calls == []
+
+
+def test_the_old_workflow_still_publishes_a_passed_check(app):
+    """Re-running only the publish job keeps the first attempt's passed check; the publisher decides."""
+    run, client = make_run(app, FakeClient(json.dumps(SUCCESS).encode()))
+    assert run.execute(hp.CheckState(old_workflow=True)).kind == "success"
+    assert len(client.calls) == 1
+
+
+def test_main_reports_the_old_workflows_failed_check_as_refused(app, tmp_path):
+    out = tmp_path / "out"
+    assert hp.main(["--app-dir", str(app), "--run-url", RUN_URL, "--reference", REF, "--out-dir", str(out),
+                    "--check-result", "failure", "--check-verdict", "", "--old-workflow"]) == 0
+    assert (out / "outcome").read_text() == "refused"
+    assert "(Reason: old_workflow)" in json.loads((out / "comment.json").read_text())["body"]
+
+
+def test_main_without_old_workflow_keeps_a_failed_check_without_verdict_infra(app, tmp_path):
+    out = tmp_path / "out"
+    hp.main(["--app-dir", str(app), "--run-url", RUN_URL, "--reference", REF, "--out-dir", str(out),
+             "--check-result", "failure", "--check-verdict", ""])
+    assert (out / "outcome").read_text() == "infra"
+
+
 def test_credentials_failure_is_infra(app):
     run, client = make_run(app)
     assert run.execute(hp.CheckState(credentials="failure")).kind == "infra"

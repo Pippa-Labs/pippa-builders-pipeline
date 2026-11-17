@@ -17,6 +17,9 @@
 #   DEPENDENCIES_OUTCOME  outcome of the dependency install step
 #   CREDENTIALS           outcome of the AWS role assumption step
 #   REPORT_TOKEN          token for the commit status and the commit comment
+#   OLD_WORKFLOW          true for the workflow made before the check was split into the prepare,
+#                         SDK and check jobs (remove after 2026-12-20): a check that failed without
+#                         a verdict is then REFUSED, push a new commit, not a platform error
 set -euo pipefail
 
 LOG_SCOPE="hack-publish"
@@ -40,6 +43,7 @@ CHECKOUT_OUTCOME="${CHECKOUT_OUTCOME:-skipped}"
 PYTHON_OUTCOME="${PYTHON_OUTCOME:-skipped}"
 DEPENDENCIES_OUTCOME="${DEPENDENCIES_OUTCOME:-skipped}"
 CREDENTIALS="${CREDENTIALS:-skipped}"
+OLD_WORKFLOW="${OLD_WORKFLOW:-false}"
 : "${REPORT_TOKEN:?token is required}"
 
 OUT_DIR="${RUNNER_TEMP}/hack-publish"
@@ -72,19 +76,25 @@ all_warnings() {
 
 run_publisher() {
   local setup="$1"
+  local args=(
+    "--app-dir=${APP_DIR}"
+    "--run-url=${RUN_URL}"
+    "--reference=${REFERENCE}"
+    "--out-dir=${OUT_DIR}"
+    "--check-result=${CHECK_RESULT}"
+    "--check-verdict=${CHECK_VERDICT}"
+    "--check-details-file=${DETAILS_FILE}"
+    "--check-warnings-file=${WARNINGS_FILE}"
+    "--credentials=${CREDENTIALS}"
+    "--setup=${setup}"
+  )
+  # Remove after 2026-12-20, with the action's input old_workflow.
+  if [ "$OLD_WORKFLOW" = "true" ]; then
+    args+=("--old-workflow")
+  fi
   printf '%s' "$CHECK_DETAILS" > "$DETAILS_FILE"
   all_warnings > "$WARNINGS_FILE"
-  env -u REPORT_TOKEN python "${HACK_DIR}/publish.py" \
-    "--app-dir=${APP_DIR}" \
-    "--run-url=${RUN_URL}" \
-    "--reference=${REFERENCE}" \
-    "--out-dir=${OUT_DIR}" \
-    "--check-result=${CHECK_RESULT}" \
-    "--check-verdict=${CHECK_VERDICT}" \
-    "--check-details-file=${DETAILS_FILE}" \
-    "--check-warnings-file=${WARNINGS_FILE}" \
-    "--credentials=${CREDENTIALS}" \
-    "--setup=${setup}"
+  env -u REPORT_TOKEN python "${HACK_DIR}/publish.py" "${args[@]}"
 }
 
 main() {

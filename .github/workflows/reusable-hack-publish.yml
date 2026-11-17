@@ -235,6 +235,8 @@ jobs:
           dependencies: ${{ steps.deps.outcome }}
           credentials: ${{ steps.aws.outcome }}
           token: ${{ github.token }}
+          # The workflow before the split passes nothing (true); remove after 2026-12-20.
+          old_workflow: "false"
           log_level: ${{ inputs.log_level }}
 
   # The other side of the prepare job's condition: says in the run summary why nothing is published.

@@ -249,6 +249,11 @@ def test_a_failed_prepare_counts_as_a_failed_check(workflow):
     )
 
 
+def test_the_publish_step_says_it_is_not_the_old_workflow(workflow):
+    """hack-publish takes a missing input as the workflow made before the split (remove after 2026-12-20)."""
+    assert publish_step(workflow)["with"]["old_workflow"] == "false"
+
+
 def test_verdicts_details_and_warnings_reach_the_publish_step(workflow):
     inputs = publish_step(workflow)["with"]
     assert inputs["check_verdict"] == "${{ needs.prepare.outputs.verdict || needs.check.outputs.verdict }}"
