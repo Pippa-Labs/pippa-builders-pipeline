@@ -124,10 +124,11 @@ BEFORE = "a" * 40
 AFTER = "b" * 40
 
 
-def test_a_push_with_a_known_before_scans_the_pushed_range():
+def test_a_push_with_a_known_before_scans_the_files_and_the_pushed_range():
     target = ss.choose_target(FakeGit({BEFORE, AFTER}), "push", {"before": BEFORE, "after": AFTER}, AFTER)
     assert target == ss.Target(BEFORE, AFTER)
-    assert target.is_range and target.describe() == "the pushed commits aaaaaaa..bbbbbbb"
+    assert target.is_range
+    assert target.describe() == "the files of the checkout and the pushed commits aaaaaaa..bbbbbbb"
 
 
 @pytest.mark.parametrize("event_name, event, known", [
@@ -145,7 +146,7 @@ def test_anything_but_a_known_range_scans_the_tree(event_name, event, known):
     assert target.describe() == "the files of the checkout"
 
 
-def test_the_range_is_passed_as_log_options_and_the_tree_as_a_directory(app, tmp_path, stub):
+def test_the_files_are_always_scanned_and_the_range_as_well_on_a_push(app, tmp_path, stub):
     base = commit_all(app)
     (app / "helper.py").write_text("X = 1\n")
     tip = commit_all(app)
@@ -153,16 +154,37 @@ def test_the_range_is_passed_as_log_options_and_the_tree_as_a_directory(app, tmp
     event.write_text(json.dumps({"before": base, "after": tip}))
     code, _, err = run_main(app, tmp_path, stub, None, "--event-name=push", f"--event-path={event}", f"--sha={tip}")
     assert code == 0, err
-    line = calls(tmp_path).splitlines()[0]
-    assert line.startswith("git ") and f"--log-opts={base}..{tip}" in line
-    for flag in ("--redact", "--no-banner", "--report-format=json", "--exit-code=3"):
-        assert flag in line
-    assert f"the pushed commits {base[:7]}..{tip[:7]}: 0 finding(s)" in err
+    files, commits = calls(tmp_path).splitlines()
+    assert files.startswith("dir ") and "--log-opts" not in files and files.endswith(" .")
+    assert commits.startswith("git ") and f"--log-opts={base}..{tip}" in commits
+    for line in (files, commits):
+        for flag in ("--redact", "--no-banner", "--report-format=json", "--exit-code=3",
+                     "--max-target-megabytes=32"):
+            assert flag in line
+    assert f"the files of the checkout and the pushed commits {base[:7]}..{tip[:7]}: 0 finding(s)" in err
 
     (tmp_path / "gitleaks-calls.log").unlink()
     code, _, _ = run_main(app, tmp_path, stub)
-    line = calls(tmp_path).splitlines()[0]
+    [line] = calls(tmp_path).splitlines()
     assert line.startswith("dir ") and "--log-opts" not in line and line.endswith(" .")
+
+
+def test_no_file_the_publisher_accepts_is_too_large_to_scan():
+    # gitleaks skips larger files silently; the publisher refuses more than 32 MB unpacked.
+    assert ss.MAX_TARGET_MEGABYTES * 1024 * 1024 >= 32 * 1024 * 1024
+
+
+def test_the_same_place_found_in_the_files_and_the_commits_is_listed_once_with_its_commit():
+    sha = "d" * 40
+    merged = ss.merge_findings([
+        ss.Finding("app.py", 3, "", "github-pat"),
+        ss.Finding("app.py", 3, sha, "github-pat"),
+        ss.Finding("b.py", 1, sha, "generic-api-key"),
+        ss.Finding("b.py", 1, "", "slack-bot-token"),
+        ss.Finding("old.py", 9, sha, "generic-api-key"),
+    ])
+    assert merged == [ss.Finding("app.py", 3, sha, "github-pat"), ss.Finding("b.py", 1, "", "slack-bot-token"),
+                      ss.Finding("old.py", 9, sha, "generic-api-key")]
 
 
 # ---- findings: where, never what ----
@@ -293,6 +315,46 @@ def test_an_unusable_app_allowlist_is_left_out_with_a_note(app, tmp_path, stub, 
     assert code == 0
     assert note in err
     assert "From the app" not in config
+
+
+@pytest.mark.parametrize("key, item", [
+    ("paths", ".*"), ("paths", "."), ("paths", r"\.py$"), ("paths", "^"), ("paths", "app"), ("paths", r"\.json$"),
+    ("paths", "(?i).*"), ("paths", "a(?i)b"),            # Go reads it, Python cannot: not trusted
+    ("regexes", ".*"), ("regexes", "."), ("regexes", "x*"), ("regexes", "[A-Za-z0-9]{20,}"), ("regexes", "^gh"),
+    ("regexes", "api_key"), ("regexes", "(?i)token"), ("regexes", "[unclosed"),
+    ("stopwords", "a"), ("stopwords", "key"), ("stopwords", "proj"), ("stopwords", "API_"),
+])
+def test_an_entry_that_skips_nearly_every_key_is_too_broad(key, item):
+    assert ss.allows_too_much(key, item)
+
+
+@pytest.mark.parametrize("key, item", [
+    ("paths", "^tests/fixtures/"), ("paths", r"(^|/)README\.md$"), ("paths", r"^docs/"),
+    ("regexes", r"FAKE-\d+"), ("regexes", "^EXAMPLE"), ("regexes", "(?i)^sample[-_]value$"),
+    ("stopwords", "sample"), ("stopwords", "notarealkey"),
+    ("commits", "a" * 40), ("targetRules", "generic-api-key"),
+])
+def test_a_narrow_entry_is_not_too_broad(key, item):
+    assert not ss.allows_too_much(key, item)
+
+
+@pytest.mark.parametrize("text", [
+    "[allowlist]\npaths = ['''.*''']\n",
+    "[allowlist]\nregexes = ['.*']\n",
+    "[allowlist]\nstopwords = ['a']\n",
+    "[allowlist]\nregexTarget = 'line'\nregexes = ['''^tests''', '''=''']\n",
+    "[[allowlists]]\npaths = ['''^tests/''']\n[[allowlists]]\ncondition = 'AND'\npaths = ['''\\.py$''']\n"
+    "regexes = ['''FAKE''']\n",
+])
+def test_an_app_allowlist_that_would_switch_the_check_off_is_not_used(app, tmp_path, stub, text):
+    (app / ".gitleaks.toml").write_text(text)
+    code, _, err, config = merged_config(app, tmp_path, stub)
+    assert code == 0
+    assert "would skip nearly every key, or could not be checked; that allowlist was not used." in err
+    assert "gitleaks:allow" in err
+    added = tomllib.loads(config)["allowlists"][3:]
+    assert all(entry.get("paths") != [r"\.py$"] and ".*" not in entry.get("regexes", []) for entry in added)
+    assert len(added) == (1 if "^tests/" in text else 0)
 
 
 def test_a_huge_or_linked_app_config_is_not_used(app, tmp_path, stub):
@@ -454,24 +516,95 @@ def test_real_gitleaks_refuses_a_pushed_key_without_printing_it(app, tmp_path):
     assert f"(commit {tip[:7]}, gitleaks rule github-pat)" in out
     for value in (FAKE_TOKEN, FAKE_KEY, "tide-watcher"):
         assert value not in out + err
-    report = (tmp_path / "work" / "report.json").read_text()
-    assert FAKE_TOKEN not in report and FAKE_KEY not in report
+    reports = sorted((tmp_path / "work").glob("report-*.json"))
+    assert [path.name for path in reports] == ["report-commits.json", "report-files.json"]
+    for report in reports:
+        assert FAKE_TOKEN not in report.read_text() and FAKE_KEY not in report.read_text()
 
 
-def test_real_gitleaks_scans_only_the_pushed_range(app, tmp_path):
+def push_event(tmp_path, before, after):
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({"before": before, "after": after}))
+    return "--event-name=push", f"--event-path={event}", f"--sha={after}"
+
+
+def test_real_gitleaks_refuses_a_key_already_refused_when_the_next_push_does_not_touch_it(app, tmp_path):
+    # Push A adds a key and is refused; push B changes another file. The key is still in the
+    # files that B would publish, so B is refused too (pushing again never lets a key through).
+    binary = real_gitleaks()
+    base = commit_all(app)
+    (app / "cfg.py").write_text(f'TOKEN = "{FAKE_TOKEN}"\n')
+    first = commit_all(app)
+    code, out, err = run_main(app, tmp_path, binary, None, *push_event(tmp_path, base, first))
+    assert code == 1, err
+    assert f"cfg.py:1 (commit {first[:7]}, gitleaks rule github-pat)" in out
+
+    (app / "helper.py").write_text("X = 1\n")
+    second = commit_all(app)
+    code, out, err = run_main(app, tmp_path, binary, None, *push_event(tmp_path, first, second))
+    assert code == 1, err
+    assert " FAIL a value that looks like a key was committed in cfg.py:1 (gitleaks rule github-pat)" in out
+    assert FAKE_TOKEN not in out + err
+
+
+def test_real_gitleaks_refuses_a_key_committed_before_the_pushed_range(app, tmp_path):
+    # A key from before the check existed (or from a run a newer push cancelled).
     binary = real_gitleaks()
     (app / "old.py").write_text(f'api_key = "{FAKE_KEY}"\n')
     base = commit_all(app)
     (app / "helper.py").write_text("X = 1\n")
     tip = commit_all(app)
-    event = tmp_path / "event.json"
-    event.write_text(json.dumps({"before": base, "after": tip}))
-    code, out, err = run_main(app, tmp_path, binary, None, "--event-name=push", f"--event-path={event}",
-                              f"--sha={tip}")
+    code, out, err = run_main(app, tmp_path, binary, None, *push_event(tmp_path, base, tip))
+    assert code == 1, err
+    assert "old.py:1 (gitleaks rule generic-api-key)" in out
+
+
+def test_real_gitleaks_refuses_a_key_added_and_removed_within_the_push(app, tmp_path):
+    binary = real_gitleaks()
+    base = commit_all(app)
+    (app / "cfg.py").write_text(f'TOKEN = "{FAKE_TOKEN}"\n')
+    added = commit_all(app)
+    (app / "cfg.py").write_text('import os\nTOKEN = os.environ["TOKEN"]\n')
+    tip = commit_all(app)
+    code, out, err = run_main(app, tmp_path, binary, None, *push_event(tmp_path, base, tip))
+    assert code == 1, err
+    assert f"cfg.py:1 (commit {added[:7]}, gitleaks rule github-pat)" in out
+
+
+def test_real_gitleaks_passes_a_clean_push_after_the_key_was_removed(app, tmp_path):
+    # Once the key is out of the files, a later push is not refused for the history before it.
+    binary = real_gitleaks()
+    (app / "cfg.py").write_text(f'TOKEN = "{FAKE_TOKEN}"\n')
+    commit_all(app)
+    (app / "cfg.py").write_text('import os\nTOKEN = os.environ["TOKEN"]\n')
+    base = commit_all(app)
+    (app / "helper.py").write_text("X = 1\n")
+    tip = commit_all(app)
+    code, out, err = run_main(app, tmp_path, binary, None, *push_event(tmp_path, base, tip))
     assert (code, out) == (0, ""), err
 
-    code, out, _ = run_main(app, tmp_path, binary)
-    assert code == 1 and "old.py:1 (gitleaks rule generic-api-key)" in out
+
+def test_real_gitleaks_scans_a_file_larger_than_its_default_limit(app, tmp_path):
+    binary = real_gitleaks()
+    filler = "# " + "padding " * 12 + "\n"
+    lines = 6 * 1024 * 1024 // len(filler) + 1
+    (app / "data.py").write_text(filler * lines + f'TOKEN = "{FAKE_TOKEN}"\n')
+    assert (app / "data.py").stat().st_size > 6 * 1024 * 1024
+    code, out, err = run_main(app, tmp_path, binary)
+    assert code == 1, err
+    assert f"data.py:{lines + 1} (gitleaks rule github-pat)" in out
+
+
+def test_real_gitleaks_an_allow_everything_app_config_cannot_switch_the_check_off(app, tmp_path):
+    binary = real_gitleaks()
+    (app / "weather.py").write_text(f'TOKEN = "{FAKE_TOKEN}"\n')
+    for text in ("[allowlist]\npaths = ['''.*''']\n", "[allowlist]\nregexes = ['''.*''']\n",
+                 "[allowlist]\nstopwords = ['''gh''']\n"):
+        (app / ".gitleaks.toml").write_text(text)
+        code, out, err = run_main(app, tmp_path, binary)
+        assert code == 1, (text, err)
+        assert "weather.py:1 (gitleaks rule github-pat)" in out
+        assert "that allowlist was not used" in out
 
 
 def test_real_gitleaks_honours_the_app_allowlist_and_gitleaksignore(app, tmp_path):

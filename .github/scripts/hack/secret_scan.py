@@ -3,18 +3,24 @@
 
 gitleaks, a pinned release whose SHA-256 is checked before it ever runs, scans:
 
-    push with a `before` this clone has  -> the pushed commits (before..after)
-    anything else: the first push of the  -> the files of the checkout
-    branch, a force push over a commit
-    the clone does not have, no push event
+    every run                            -> the files of the checkout: what would be published
+    push with a `before` this clone has  -> also the pushed commits (before..after)
 
-with gitleaks' own rules and the allowlists in gitleaks.toml next to this file
+The files are scanned every time, so a key that is still in the app fails every run until it
+is taken out: pushing again, or a run cancelled by a newer push, never lets it through, and
+neither does a key committed before this check existed. The pushed commits are scanned too,
+because a key that was added and removed again within one push is still in the history.
+
+The scans use gitleaks' own rules and the allowlists in gitleaks.toml next to this file
 (.env.example, provider demo keys such as NASA's DEMO_KEY, obvious placeholders,
 lines marked `pragma: allowlist secret`). The app adds its own allowlists in
 .gitleaks.toml at the top of its repository: only its [allowlist] and
-[[allowlists]] tables are used, never rules, so an app can skip a false positive
-but cannot switch the check off. gitleaks also skips the fingerprints listed in
-the app's .gitleaksignore and every line that ends in a `gitleaks:allow` comment.
+[[allowlists]] tables are used, never rules, and an allowlist with an entry that
+would skip nearly every key (a path pattern that matches app.py, a pattern that
+matches an ordinary key, a stopword shorter than 4 characters, or a pattern that
+cannot be checked) is left out with a note. So an app can skip a false positive but
+not switch the check off. gitleaks also skips the fingerprints listed in the app's
+.gitleaksignore and every line that ends in a `gitleaks:allow` comment.
 
 A finding never shows the value: gitleaks runs with --redact, and only the file,
 the line, the commit and the rule's name are read from its report (never the
@@ -80,11 +86,26 @@ APP_ALLOWLIST_CHOICES = {
 }
 #: An allowlist with none of these allows nothing; gitleaks refuses such a table.
 APP_ALLOWLIST_CHECKS = ("paths", "regexes", "stopwords", "commits")
+#: Files every app has, or could hide a key in: a `paths` pattern that matches one skips too much.
+BROAD_PATH_SAMPLES = ("x", "app.py", "manifest.yaml", "config.py", "src/app/settings.py", "data/keys.json", ".env")
+#: Ordinary keys, and lines that hold one: a `regexes` pattern or a stopword that matches one skips
+#: too much, whatever its regexTarget. Built from pieces so that this file is not a finding itself.
+_SAMPLE_KEY = "Zx81" + "Qp0vLm7T" + "nR4wYc2K" + "bH9sJd6F"
+_SAMPLE_TOKEN = "gh" + "p_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+_SAMPLE_PREFIXED = "s" + "k-" + "proj-" + "Tq7Wm2Xc9Lb4Vn8Rf1Hz6Kd3"
+BROAD_SECRET_SAMPLES = (
+    "x", _SAMPLE_KEY, _SAMPLE_TOKEN, _SAMPLE_PREFIXED,
+    f'api_key = "{_SAMPLE_KEY}"', f'TOKEN = "{_SAMPLE_TOKEN}"', f"OPENAI_API_KEY={_SAMPLE_PREFIXED}",
+)
+#: A stopword skips every finding that contains it, so a short one skips nearly all of them.
+MIN_STOPWORD_CHARS = 4
 
 SCAN_TIMEOUT_SECONDS = 240
 #: gitleaks' exit code when it found something (--exit-code); any other non-zero code is an error.
 LEAKS_EXIT = 3
-MAX_TARGET_MEGABYTES = 5
+#: gitleaks skips a larger file without a word. The publisher refuses an app whose files add up
+#: to more than this (its MAX_UNPACKED_BYTES), so a file too large to scan is never published.
+MAX_TARGET_MEGABYTES = 32
 GENERIC_RULE = "generic-api-key"
 
 SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
@@ -288,6 +309,12 @@ class AppConfigReader:
                 result.notes.append(f"{key} in {APP_CONFIG} must be a list of at most {MAX_APP_LIST_ITEMS} "
                                     f"one-line strings; that allowlist was not used.")
                 return ""
+            broad = next((item for item in items if allows_too_much(key, item)), None)
+            if broad is not None:
+                result.notes.append(f"{key} entry {shown(broad)!r} in {APP_CONFIG} would skip nearly every "
+                                    "key, or could not be checked; that allowlist was not used. Mark a false "
+                                    "positive with a `gitleaks:allow` comment at the end of its line instead.")
+                return ""
             if items:
                 lines.append(f"{key} = [{', '.join(toml_string(item) for item in items)}]")
                 checks += key in APP_ALLOWLIST_CHECKS
@@ -305,6 +332,25 @@ class AppConfigReader:
                    and not has_control_characters(item) for item in value):
             return None
         return list(value)
+
+
+def allows_too_much(key: str, item: str) -> bool:
+    """Whether one entry of an app allowlist would skip (nearly) every finding.
+
+    gitleaks matches Go regular expressions, unanchored. Python's `re` reads the same syntax
+    for what an allowlist needs; a pattern it cannot read cannot be checked, so is not trusted.
+    """
+    if key == "stopwords":
+        word = item.lower()
+        return len(item) < MIN_STOPWORD_CHARS or any(word in sample.lower() for sample in BROAD_SECRET_SAMPLES)
+    if key not in ("paths", "regexes"):
+        return False
+    try:
+        pattern = re.compile(item)
+    except (re.error, OverflowError, RecursionError):
+        return True
+    samples = BROAD_PATH_SAMPLES if key == "paths" else BROAD_SECRET_SAMPLES
+    return any(pattern.search(sample) for sample in samples)
 
 
 def write_config(path: Path, base: str, app_tables: list[str]) -> Path:
@@ -336,7 +382,7 @@ class Git:
 
 @dataclass(frozen=True)
 class Target:
-    """The pushed commits (`before`..`after`), or the files of the checkout when `before` is empty."""
+    """The files of the checkout, and also the pushed commits (`before`..`after`) when `before` is set."""
 
     before: str = ""
     after: str = ""
@@ -347,7 +393,8 @@ class Target:
 
     def describe(self) -> str:
         if self.is_range:
-            return f"the pushed commits {self.before[:SHORT_SHA]}..{self.after[:SHORT_SHA]}"
+            return (f"the files of the checkout and the pushed commits "
+                    f"{self.before[:SHORT_SHA]}..{self.after[:SHORT_SHA]}")
         return "the files of the checkout"
 
 
@@ -397,28 +444,46 @@ class Finding:
 
 def read_findings(report: Path) -> list[Finding]:
     """The file, line, commit and rule of each finding; nothing else of the report is read."""
+    return merge_findings(parse_report(report))
+
+
+def merge_findings(findings: list[Finding]) -> list[Finding]:
+    """One finding per file and line, sorted.
+
+    A provider's own rule says more than the generic one, and a finding that names the commit
+    (the scan of the pushed commits) more than the same one in the files.
+    """
+    def rank(finding: Finding) -> tuple[bool, bool]:
+        return finding.rule != GENERIC_RULE, bool(finding.commit)
+
+    found: dict[tuple[str, int], Finding] = {}
+    for finding in findings:
+        key = (finding.file, finding.line)
+        if key not in found or rank(finding) > rank(found[key]):
+            found[key] = finding
+    return sorted(found.values(), key=lambda finding: (finding.file, finding.line))
+
+
+def parse_report(report: Path) -> list[Finding]:
+    """Every finding of a gitleaks JSON report, unmerged."""
     try:
         items = json.loads(report.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ScanError(f"the gitleaks report could not be read: {type(exc).__name__}") from exc
     if not isinstance(items, list):
         raise ScanError("the gitleaks report is not a list")
-    found: dict[tuple[str, int], Finding] = {}
+    findings: list[Finding] = []
     for item in items:
         if not isinstance(item, dict):
             continue
         line = item.get("StartLine")
-        finding = Finding(
+        findings.append(Finding(
             file=shown(item.get("File") or "?"),
             line=line if isinstance(line, int) and line > 0 else 0,
             commit=str(item.get("Commit") or "") if SHA.match(str(item.get("Commit") or "")) else "",
             rule=shown(item.get("RuleID") or "?"),
-        )
-        key = (finding.file, finding.line)
-        # One line per place; a provider's own rule says more than the generic one.
-        if key not in found or (found[key].rule == GENERIC_RULE and finding.rule != GENERIC_RULE):
-            found[key] = finding
-    return sorted(found.values(), key=lambda finding: (finding.file, finding.line))
+        ))
+    return findings
 
 
 class Gitleaks:
@@ -430,10 +495,17 @@ class Gitleaks:
         self.work_dir = work_dir
 
     def scan(self, config: Path, target: Target) -> list[Finding]:
-        report = self.work_dir / "report.json"
+        """The files of the checkout, then the pushed commits when there is a range."""
+        findings = self._run(config, target, history=False)
+        if target.is_range:
+            findings += self._run(config, target, history=True)
+        return merge_findings(findings)
+
+    def _run(self, config: Path, target: Target, history: bool) -> list[Finding]:
+        report = self.work_dir / ("report-commits.json" if history else "report-files.json")
         report.unlink(missing_ok=True)
         args = [
-            str(self.binary), "git" if target.is_range else "dir",
+            str(self.binary), "git" if history else "dir",
             "--no-banner", "--redact", "--log-level=warn",
             f"--config={config}",
             "--report-format=json", f"--report-path={report}",
@@ -442,7 +514,7 @@ class Gitleaks:
             f"--timeout={SCAN_TIMEOUT_SECONDS}",
             f"--gitleaks-ignore-path={self._ignore_path()}",
         ]
-        if target.is_range:
+        if history:
             args.append(f"--log-opts={target.before}..{target.after}")
         args.append(".")
         environment = {name: value for name, value in os.environ.items() if not name.startswith("GITLEAKS_")}
@@ -458,7 +530,7 @@ class Gitleaks:
         if result.returncode not in (0, LEAKS_EXIT):
             tail = " | ".join(line.strip() for line in result.stderr.strip().splitlines()[-3:])
             raise ScanError(f"gitleaks failed (exit {result.returncode}): {tail[:400]}")
-        return read_findings(report)
+        return parse_report(report)
 
     def _ignore_path(self) -> Path:
         """The app's .gitleaksignore when it is a regular file, else an empty directory."""

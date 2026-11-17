@@ -710,9 +710,11 @@ def test_prepare_uses_a_test_gitleaks_only_outside_github_actions():
 GUARD = ("github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'Pippa-Labs' "
          "&& startsWith(github.event.repository.name, 'pippa-hack-') && !github.event.repository.fork "
          "&& github.repository != 'Pippa-Labs/pippa-hack-template' "
-         "&& github.repository != 'Pippa-Labs/pippa-hack-template-public'")
+         "&& github.repository != 'Pippa-Labs/pippa-hack-template-public' "
+         "&& github.triggering_actor == github.actor")
 PUSHED = {"EVENT_NAME": "push", "REF": "refs/heads/main", "OWNER": "Pippa-Labs",
-          "REPOSITORY": "Pippa-Labs/pippa-hack-smoke", "REPOSITORY_NAME": "pippa-hack-smoke", "FORK": "false"}
+          "REPOSITORY": "Pippa-Labs/pippa-hack-smoke", "REPOSITORY_NAME": "pippa-hack-smoke", "FORK": "false",
+          "ACTOR": "tide-watcher", "TRIGGERING_ACTOR": "tide-watcher"}
 
 
 def skipped_reason(tmp_path, **changes):
@@ -740,6 +742,9 @@ def skipped_reason(tmp_path, **changes):
      "this is the app template; the repositories created from it publish."),
     ({"REPOSITORY": "Pippa-Labs/pippa-hack-template-public", "REPOSITORY_NAME": "pippa-hack-template-public"},
      "this is the app template; the repositories created from it publish."),
+    ({"TRIGGERING_ACTOR": "night-owl-7"},
+     "this re-run was started by night-owl-7, not by tide-watcher, who pushed; only the account that pushed can "
+     "re-run a publish. Push again instead."),
     ({}, "this run does not meet the conditions for publishing."),
 ])
 def test_the_skipped_job_writes_one_line_saying_why(tmp_path, changes, reason):
@@ -756,3 +761,8 @@ def test_the_skipped_job_runs_exactly_when_prepare_does_not():
     assert workflow["jobs"]["prepare"]["if"] == GUARD
     assert workflow["jobs"]["skipped"]["if"] == f"${{{{ !({GUARD}) }}}}"
     assert workflow["jobs"]["skipped"]["permissions"] == {}
+
+
+def test_the_skipped_job_never_echoes_markup_from_an_actor(tmp_path):
+    summary = skipped_reason(tmp_path, TRIGGERING_ACTOR="<b>x</b>`$(id)`")
+    assert summary.startswith("Not published: this re-run was started by ?b?x?/b????id??, not by tide-watcher,")
