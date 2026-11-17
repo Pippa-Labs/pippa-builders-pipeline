@@ -17,7 +17,7 @@ GUARD = ("github.event_name == 'push' && github.ref == 'refs/heads/main' && gith
          "&& github.repository != 'Pippa-Labs/pippa-hack-template-public' "
          "&& github.triggering_actor == github.actor")
 HANDOVER_PATH = "${{ runner.temp }}/hack-sdk-handover"
-HANDOVER_KEY = "pippa-hack-sdk-${{ github.run_id }}"
+HANDOVER_ENTRY = "pippa-hack-sdk-${{ github.run_id }}-${{ github.run_attempt }}"
 
 
 @pytest.fixture(scope="module")
@@ -116,15 +116,29 @@ def test_the_sdk_job_is_never_in_an_environment(workflow):
 def test_the_sdk_reaches_the_check_job_as_a_cache_entry_of_this_run_never_an_artifact(workflow):
     save = steps(workflow, "sdk")[-1]
     restore = next(step for step in steps(workflow, "check") if "cache/restore" in step.get("uses", ""))
-    assert save["with"] == {"path": HANDOVER_PATH, "key": HANDOVER_KEY}
-    assert restore["with"] == {"path": HANDOVER_PATH, "key": HANDOVER_KEY, "fail-on-cache-miss": True}
+    assert save["with"] == {"path": HANDOVER_PATH, "key": HANDOVER_ENTRY}
+    assert restore["with"] == {"path": HANDOVER_PATH, "key": "${{ needs.sdk.outputs.handover_entry }}",
+                               "fail-on-cache-miss": True}
     assert "upload-artifact" not in WORKFLOW.read_text() and "download-artifact" not in WORKFLOW.read_text()
+
+
+def test_the_check_job_restores_the_entry_the_sdk_job_sealed_with_the_key_it_gets(workflow):
+    # A cache entry cannot be replaced. "Re-run all jobs" seals with a new key, so it saves an entry
+    # of its own attempt; "Re-run failed jobs" keeps the SDK job's outputs, entry name and key alike.
+    assert workflow["jobs"]["sdk"]["outputs"]["handover_entry"] == HANDOVER_ENTRY
+    assert "github.run_attempt" in HANDOVER_ENTRY
+    restore = next(step for step in steps(workflow, "check") if "cache/restore" in step.get("uses", ""))
+    install = next(step for step in steps(workflow, "check") if step.get("with", {}).get("mode") == "sdk-install")
+    # Both come from the outputs of the same attempt of the SDK job, never from the check job's own attempt.
+    assert restore["with"]["key"] == "${{ needs.sdk.outputs.handover_entry }}"
+    assert install["with"]["handover_key"] == "${{ needs.sdk.outputs.handover_key }}"
 
 
 def test_the_key_of_the_sealed_hand_over_goes_from_the_sdk_job_to_the_install_step_only(workflow):
     # The cache entry can be restored by a pull request's run, also from a fork; the job output
     # that carries the key cannot.
-    assert workflow["jobs"]["sdk"]["outputs"] == {"handover_key": "${{ steps.fetch.outputs.handover_key }}"}
+    assert workflow["jobs"]["sdk"]["outputs"] == {"handover_key": "${{ steps.fetch.outputs.handover_key }}",
+                                                  "handover_entry": HANDOVER_ENTRY}
     fetch = next(step for step in steps(workflow, "sdk") if step.get("with", {}).get("mode") == "sdk-fetch")
     assert fetch["id"] == "fetch"
     for step in steps(workflow, "check"):

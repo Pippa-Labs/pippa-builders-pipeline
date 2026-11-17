@@ -83,8 +83,11 @@ jobs:
     timeout-minutes: 5
     permissions:
       id-token: write
+    # A cache entry cannot be replaced, and "Re-run all jobs" seals with a new key, so each attempt
+    # saves an entry of its own; "Re-run failed jobs" keeps these outputs, name and key alike.
     outputs:
       handover_key: ${{ steps.fetch.outputs.handover_key }}
+      handover_entry: pippa-hack-sdk-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -110,7 +113,7 @@ jobs:
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/hack-sdk-handover
-          key: pippa-hack-sdk-${{ github.run_id }}
+          key: pippa-hack-sdk-${{ github.run_id }}-${{ github.run_attempt }}
 
   # Runs the app's code: no credentials, no id-token.
   check:
@@ -140,7 +143,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/hack-sdk-handover
-          key: pippa-hack-sdk-${{ github.run_id }}
+          key: ${{ needs.sdk.outputs.handover_entry }}
           fail-on-cache-miss: true
 
       # Everything up to here runs before any app code.
