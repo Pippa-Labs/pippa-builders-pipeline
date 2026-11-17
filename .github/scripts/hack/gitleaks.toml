@@ -1,0 +1,34 @@
+# The gitleaks configuration of the publish workflow's secret check (secret_scan.py).
+#
+# gitleaks' own rules (extend.useDefault), plus the allowlists every hackathon app gets.
+# secret_scan.py appends the allowlists of the app's own .gitleaks.toml, never its rules.
+# The same file lives in pippa-common-pipeline and pippa-builders-pipeline; change both.
+
+title = "Pippa hackathon app secret check"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Example files that list the names of keys, never their values"
+paths = [
+  '''(^|/)\.env\.example$''',
+]
+
+[[allowlists]]
+description = "Provider-published demo keys and obvious placeholders"
+regexes = [
+  '''(?i)^demo_key$''',
+  '''(?i)^(your|my)[-_ ]?(api[-_ ]?)?(key|token|secret)[-_ ]?here$''',
+  '''(?i)^(changeme|change[-_]me|replace[-_]me|placeholder|dummy)$''',
+  '''^(x{3,}|X{3,}|\*{3,}|\.{3,})$''',
+  '''^<[^<>]*>$''',
+  '''^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$''',
+]
+
+[[allowlists]]
+description = "Test values marked the way the app template's own secret check accepts"
+regexTarget = "line"
+regexes = [
+  '''pragma:\s*allowlist\s+secret''',
+]
