@@ -13,7 +13,8 @@ SHA_PIN = re.compile(r"^[^@]+@[0-9a-f]{40}$")
 GUARD = ("github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'Pippa-Labs' "
          "&& startsWith(github.event.repository.name, 'pippa-hack-') && !github.event.repository.fork "
          "&& github.repository != 'Pippa-Labs/pippa-hack-template' "
-         "&& github.repository != 'Pippa-Labs/pippa-hack-template-public'")
+         "&& github.repository != 'Pippa-Labs/pippa-hack-template-public' "
+         "&& github.triggering_actor == github.actor")
 HANDOVER_PATH = "${{ runner.temp }}/hack-sdk-handover"
 HANDOVER_KEY = "pippa-hack-sdk-${{ github.run_id }}"
 
@@ -239,3 +240,22 @@ def test_no_expression_is_expanded_inside_a_script(workflow):
     for job in workflow["jobs"].values():
         for step in job["steps"]:
             assert "${{" not in step.get("run", ""), step.get("name")
+
+
+# ---- concurrency: a newer push cancels an older one, nothing else cancels a push ----
+
+def test_only_a_push_cancels_a_run_and_only_another_push(workflow):
+    concurrency = workflow["concurrency"]
+    assert concurrency["group"] == (
+        "hack-publish-${{ github.repository }}-${{ github.event_name == 'push' && 'push' || github.run_id }}"
+    )
+    assert concurrency["cancel-in-progress"] == "${{ github.event_name == 'push' }}"
+    for name, job_config in workflow["jobs"].items():
+        assert "concurrency" not in job_config, name
+
+
+def test_a_rerun_by_another_account_does_not_publish(workflow):
+    assert workflow["jobs"]["prepare"]["if"].endswith(" && github.triggering_actor == github.actor")
+    env = workflow["jobs"]["skipped"]["steps"][0]["env"]
+    assert env["ACTOR"] == "${{ github.actor }}"
+    assert env["TRIGGERING_ACTOR"] == "${{ github.triggering_actor }}"

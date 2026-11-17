@@ -12,13 +12,17 @@ on:
 permissions:
   contents: read
 
+# A newer push cancels the run of an older one. Any other run (a "Run workflow" click, another
+# trigger a builder adds) gets a group of its own and cancels nothing: it only reports why it
+# does not publish, and must never stop a push's run halfway through publishing.
 concurrency:
-  group: hack-publish-${{ github.repository }}
-  cancel-in-progress: true
+  group: hack-publish-${{ github.repository }}-${{ github.event_name == 'push' && 'push' || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'push' }}
 
 # Only a push to main of a Pippa-Labs pippa-hack-* repository publishes: never another event,
-# branch, owner or repository, a fork, or one of the two templates. The `skipped` job says why
-# in the run summary when this does not hold.
+# branch, owner or repository, a fork, or one of the two templates; and a re-run only when the
+# account that pushed starts it (a re-run keeps the pusher as `actor`, and so in the token). The
+# `skipped` job says why in the run summary when this does not hold.
 #
 # App code runs only in the check job, which has no credentials and no `id-token`. The SDK job
 # fetches the Pippa SDK with the SDK read role and hands the wheel over as a cache entry of this
@@ -27,7 +31,7 @@ jobs:
   # Runs no app code: personal data, committed keys, nothing to publish yet, dependencies.
   prepare:
     name: Prepare
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'Pippa-Labs' && startsWith(github.event.repository.name, 'pippa-hack-') && !github.event.repository.fork && github.repository != 'Pippa-Labs/pippa-hack-template' && github.repository != 'Pippa-Labs/pippa-hack-template-public'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'Pippa-Labs' && startsWith(github.event.repository.name, 'pippa-hack-') && !github.event.repository.fork && github.repository != 'Pippa-Labs/pippa-hack-template' && github.repository != 'Pippa-Labs/pippa-hack-template-public' && github.triggering_actor == github.actor
     runs-on: ubuntu-latest
     timeout-minutes: 8
     permissions:
@@ -225,7 +229,7 @@ jobs:
   # The other side of the prepare job's condition: says in the run summary why nothing is published.
   skipped:
     name: Not published
-    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'Pippa-Labs' && startsWith(github.event.repository.name, 'pippa-hack-') && !github.event.repository.fork && github.repository != 'Pippa-Labs/pippa-hack-template' && github.repository != 'Pippa-Labs/pippa-hack-template-public') }}
+    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'Pippa-Labs' && startsWith(github.event.repository.name, 'pippa-hack-') && !github.event.repository.fork && github.repository != 'Pippa-Labs/pippa-hack-template' && github.repository != 'Pippa-Labs/pippa-hack-template-public' && github.triggering_actor == github.actor) }}
     runs-on: ubuntu-latest
     timeout-minutes: 2
     permissions: {}
@@ -239,6 +243,8 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           REPOSITORY_NAME: ${{ github.event.repository.name }}
           FORK: ${{ github.event.repository.fork }}
+          ACTOR: ${{ github.actor }}
+          TRIGGERING_ACTOR: ${{ github.triggering_actor }}
         run: |
           set -euo pipefail
           plain() { local value="${1//[^A-Za-z0-9._\/-]/?}"; printf '%s' "${value:0:100}"; }
@@ -255,6 +261,8 @@ jobs:
             reason="a fork never publishes; only the app repository Pippa Labs created does."
           elif [ "$(lower "$REPOSITORY")" = "pippa-labs/pippa-hack-template" ] || [ "$(lower "$REPOSITORY")" = "pippa-labs/pippa-hack-template-public" ]; then
             reason="this is the app template; the repositories created from it publish."
+          elif [ "$TRIGGERING_ACTOR" != "$ACTOR" ]; then
+            reason="this re-run was started by $(plain "$TRIGGERING_ACTOR"), not by $(plain "$ACTOR"), who pushed; only the account that pushed can re-run a publish. Push again instead."
           else
             reason="this run does not meet the conditions for publishing."
           fi
