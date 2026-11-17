@@ -102,6 +102,8 @@ def base_env(tmp_path, bindir):
         "GITHUB_SHA": "abc123",
         "GITHUB_RUN_ID": "99",
         "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_ACTOR": "tide-watcher",
+        "GITHUB_TRIGGERING_ACTOR": "tide-watcher",
         "GITHUB_SERVER_URL": "https://github.com",
         "GITHUB_ACTIONS": "false",
         "HACK_GITLEAKS_BIN": str(bindir / "gitleaks"),

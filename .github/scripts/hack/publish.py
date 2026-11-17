@@ -10,7 +10,13 @@ itself may not publish (a `reason` of IDENTITY_REFUSALS: pushed by somebody who
 is not the repository's builder, a token used twice, not a push). Every invoke
 carries a token requested for that attempt: the publisher accepts a token once.
 A published app whose API keys are not all added yet says so first, apart from
-the warnings that a push fixes. Writes the report files the action posts:
+the warnings that a push fixes.
+
+A run the account that pushed did not start (GITHUB_TRIGGERING_ACTOR is not
+GITHUB_ACTOR: somebody else's re-run) stops before anything else, with exit
+status RERUN_REFUSED_EXIT: no token is requested, nothing is sent to Pippa and
+no report is written, so nothing is posted on the commit. Writes the report
+files the action posts:
 
     outcome       success, code, refused or infra
     status.json   body for POST /repos/{owner}/{repo}/statuses/{sha}
@@ -43,7 +49,7 @@ import zipfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 LOG = logging.getLogger("hack-publish")
 
@@ -136,6 +142,13 @@ SKIP_NAMES = frozenset({
 REQUIRED_FILES = ("app.py", "manifest.yaml")
 SUCCESS_FIELDS = ("app_id", "version", "name")
 
+#: Exit status when somebody other than the account that pushed started the run (sysexits'
+#: EX_NOPERM). hack-publish.sh then fails the job and posts and counts nothing.
+RERUN_REFUSED_EXIT = 77
+#: Characters an account name keeps in the log; anything else becomes "?".
+ACCOUNT_UNSAFE = re.compile(r"[^A-Za-z0-9._\[\]-]")
+ACCOUNT_LIMIT = 100
+
 
 class PublishError(Exception):
     """Base error of a publish run."""
@@ -178,6 +191,32 @@ def first_line(text: str) -> str:
     for line in text.splitlines():
         if line.strip():
             return line.strip()
+    return ""
+
+
+def plain_account(name: str) -> str:
+    """An account name as plain text for the log, so it can never start a workflow command."""
+    return ACCOUNT_UNSAFE.sub("?", name)[:ACCOUNT_LIMIT]
+
+
+def started_by_another_account(environ: Mapping[str, str]) -> str:
+    """Why the run may not publish because the account that pushed did not start it; "" when it did.
+
+    A re-run keeps the pusher as GITHUB_ACTOR (and so in the token) and names whoever started it in
+    GITHUB_TRIGGERING_ACTOR. The workflow skips every job of such a re-run; this check also stops
+    one whose workflow has no such condition (a re-run of single jobs replays the first attempt's
+    workflow, while this file comes from the action's current ref). The names must match exactly,
+    and a run that does not give both is refused too.
+    """
+    actor = environ.get("GITHUB_ACTOR", "")
+    triggering = environ.get("GITHUB_TRIGGERING_ACTOR", "")
+    if not actor or not triggering:
+        return ("Not published: the run does not say both who pushed (GITHUB_ACTOR) and who started it "
+                "(GITHUB_TRIGGERING_ACTOR), so it cannot show that the account that pushed started it.")
+    if actor != triggering:
+        return (f"Not published: this re-run was started by {plain_account(triggering)}, not by "
+                f"{plain_account(actor)}, who pushed; only the account that pushed can re-run a publish. "
+                "Push again instead.")
     return ""
 
 
@@ -740,6 +779,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] [%(name)s] %(message)s")
     args = parse_args(argv)
+    refusal = started_by_another_account(os.environ)
+    if refusal:
+        LOG.error("%s", refusal)
+        return RERUN_REFUSED_EXIT
     state = CheckState(
         result=args.check_result,
         verdict=args.check_verdict,

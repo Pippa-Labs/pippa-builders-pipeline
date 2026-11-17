@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Publishes the app, reports the result on the commit and fails the job on any error.
 #
+# A run somebody other than the account that pushed started (a re-run) only fails the job:
+# publish.py stops it before any token with exit status RERUN_REFUSED, and nothing is posted on
+# the commit or counted as a platform error.
+#
 # Env:
 #   APP_DIR               directory of the checked out app repository
 #   CHECK_RESULT          result of the check job
@@ -43,6 +47,8 @@ DETAILS_FILE="${RUNNER_TEMP}/hack-check-details.txt"
 WARNINGS_FILE="${RUNNER_TEMP}/hack-check-warnings.txt"
 RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
 REFERENCE="gh-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+# publish.py's exit status when the account that pushed did not start the run (RERUN_REFUSED_EXIT).
+RERUN_REFUSED=77
 
 setup_outcome() {
   if [ "$CHECKOUT_OUTCOME" = "success" ] && [ "$PYTHON_OUTCOME" = "success" ] \
@@ -85,10 +91,15 @@ main() {
   rm -rf "$OUT_DIR"
   mkdir -p "$OUT_DIR"
 
-  local setup
+  local setup status=0
   setup="$(setup_outcome)"
 
-  if ! run_publisher "$setup"; then
+  run_publisher "$setup" || status=$?
+  if [ "$status" -eq "$RERUN_REFUSED" ]; then
+    log_error "Not published: only the account that pushed can re-run a publish; nothing is reported on the commit"
+    exit 1
+  fi
+  if [ "$status" -ne 0 ]; then
     log_error "The publisher module failed; reporting a platform error"
     bash "${ACTION_DIR}/scripts/fallback-report.sh" "$OUT_DIR" "$RUN_URL" "$REFERENCE"
   fi

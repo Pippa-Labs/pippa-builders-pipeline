@@ -23,6 +23,14 @@ RUN_URL = "https://github.com/Pippa-Labs/pippa-hack-x/actions/runs/1"
 REF = "gh-1-1"
 
 MANIFEST = "manifest_version: 1\napp:\n  id: hack.x\n  name: Days Until\n  version: 0.1.0\n"
+PUSHER = "tide-watcher"
+
+
+@pytest.fixture(autouse=True)
+def started_by_the_pusher(monkeypatch):
+    """As in a first run: the account that pushed started it."""
+    monkeypatch.setenv("GITHUB_ACTOR", PUSHER)
+    monkeypatch.setenv("GITHUB_TRIGGERING_ACTOR", PUSHER)
 
 
 @pytest.fixture
@@ -405,6 +413,92 @@ def test_other_client_errors_are_not_retried(app):
     run, _ = make_run(app, client)
     assert run.execute(hp.CheckState()).kind == "infra"
     assert len(client.calls) == 1
+
+
+class Recorder:
+    """Stands in for the token provider and the publisher; records that either was made at all."""
+
+    made = []
+
+    def __init__(self, *args, **kwargs):
+        Recorder.made.append(type(self).__name__)
+
+    def token(self, audience):
+        raise AssertionError("a token was requested")
+
+
+class TokenRecorder(Recorder, hp.TokenProvider):
+    pass
+
+
+class PublisherRecorder(Recorder):
+    def publish(self, make_event):
+        raise AssertionError("the publisher was invoked")
+
+
+@pytest.fixture
+def recorded(monkeypatch):
+    Recorder.made = []
+    monkeypatch.setattr(hp, "ActionsTokenProvider", TokenRecorder)
+    monkeypatch.setattr(hp, "LambdaPublisher", PublisherRecorder)
+    return Recorder.made
+
+
+@pytest.mark.parametrize("actor, triggering", [
+    (PUSHER, "org-writer"),
+    (PUSHER, "Tide-Watcher"),
+    (PUSHER, ""),
+    ("", PUSHER),
+    (None, None),
+])
+def test_a_run_the_pusher_did_not_start_requests_no_token_and_writes_no_report(
+        app, tmp_path, monkeypatch, caplog, recorded, actor, triggering):
+    for name, value in (("GITHUB_ACTOR", actor), ("GITHUB_TRIGGERING_ACTOR", triggering)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    out = tmp_path / "out"
+    rc = hp.main(["--app-dir", str(app), "--run-url", RUN_URL, "--reference", REF, "--out-dir", str(out)])
+    assert rc == hp.RERUN_REFUSED_EXIT == 77
+    assert recorded == []
+    assert not out.exists() or list(out.iterdir()) == []
+    assert "Not published:" in caplog.text
+
+
+def test_a_rerun_by_another_account_names_both_accounts(app, tmp_path, monkeypatch, caplog, recorded):
+    monkeypatch.setenv("GITHUB_TRIGGERING_ACTOR", "org-writer")
+    hp.main(["--app-dir", str(app), "--run-url", RUN_URL, "--reference", REF, "--out-dir", str(tmp_path / "out")])
+    assert ("this re-run was started by org-writer, not by tide-watcher, who pushed; only the account that "
+            "pushed can re-run a publish") in caplog.text
+
+
+def test_a_rerun_by_another_account_reports_not_even_a_failed_check(app, tmp_path, monkeypatch, recorded):
+    monkeypatch.setenv("GITHUB_TRIGGERING_ACTOR", "org-writer")
+    details = tmp_path / "details.txt"
+    details.write_text(" FAIL the tests fail")
+    out = tmp_path / "out"
+    rc = hp.main(["--app-dir", str(app), "--run-url", RUN_URL, "--reference", REF, "--out-dir", str(out),
+                  "--check-result", "failure", "--check-verdict", "failed", "--check-details-file", str(details)])
+    assert rc == hp.RERUN_REFUSED_EXIT
+    assert not out.exists() or list(out.iterdir()) == []
+
+
+def test_account_names_reach_the_log_as_plain_text(app, tmp_path, monkeypatch, caplog, recorded):
+    monkeypatch.setenv("GITHUB_TRIGGERING_ACTOR", "x\n::error::forged" + "y" * 200)
+    hp.main(["--app-dir", str(app), "--run-url", RUN_URL, "--reference", REF, "--out-dir", str(tmp_path / "out")])
+    message = next(record.getMessage() for record in caplog.records if "Not published" in record.getMessage())
+    assert "\n" not in message and "::" not in message
+    assert "x???error??forged" in message and "y" * 100 not in message
+
+
+def test_the_pushers_own_run_goes_on_to_publish(app, tmp_path, recorded):
+    out = tmp_path / "out"
+    rc = hp.main(["--app-dir", str(app), "--run-url", RUN_URL, "--reference", REF, "--out-dir", str(out),
+                  "--credentials", "failure"])
+    assert rc == 0
+    assert (out / "outcome").read_text() == "infra"
+    assert recorded == ["TokenRecorder"], "built, though the missing credentials stop it before any request"
 
 
 def test_cli_accepts_values_starting_with_dashes(app, tmp_path):

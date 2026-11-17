@@ -615,6 +615,27 @@ def test_publish_module_crash_uses_fallback_report(tmp_path, bin_dir):
     assert posted(calls, "/commits/abc123/comments")["body"].startswith("PLATFORM_ERROR")
 
 
+def test_publish_of_a_rerun_another_account_started_sends_counts_and_reports_nothing(tmp_path, bin_dir):
+    make_app(tmp_path)
+    result, calls = run_publish(tmp_path, bin_dir, GITHUB_TRIGGERING_ACTOR="org-writer")
+    assert result.returncode == 1
+    assert "gh " not in calls, "nothing is posted on the commit"
+    assert "aws " not in calls, "no platform error is counted"
+    assert "this re-run was started by org-writer, not by tide-watcher, who pushed" in result.stderr
+    assert "only the account that pushed can re-run a publish; nothing is reported on the commit" in result.stderr
+    assert not (tmp_path / "runner" / "hack-publish" / "outcome").exists()
+
+
+def test_publish_reports_nothing_when_the_module_says_another_account_started_the_run(tmp_path, bin_dir):
+    make_app(tmp_path)
+    (bin_dir / "python").unlink()
+    write_exec(bin_dir / "python", "#!/bin/sh\nexit 77\n")
+    result, calls = run_publish(tmp_path, bin_dir)
+    assert result.returncode == 1
+    assert "gh " not in calls and "aws " not in calls
+    assert "PLATFORM_ERROR" not in calls
+
+
 def test_publish_hands_the_check_warnings_to_the_module(tmp_path, bin_dir):
     make_app(tmp_path)
     result, _ = run_publish(tmp_path, bin_dir, CHECK_RESULT="failure", CHECK_VERDICT="failed",
