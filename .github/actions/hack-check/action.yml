@@ -1,9 +1,9 @@
 name: Hackathon app check
-description: Steps of the check job of the hackathon publish workflow, one per mode (prepare, sdk, clear, check)
+description: Steps of the prepare, SDK and check jobs of the hackathon publish workflow, one per mode (prepare, sdk-fetch, sdk-install, check)
 
 inputs:
   mode:
-    description: prepare, sdk, clear or check
+    description: prepare (prepare job), sdk-fetch (SDK job), sdk-install or check (check job)
     required: true
   log_level:
     description: Global log level (DEBUG, INFO, WARN, ERROR)
@@ -27,7 +27,7 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Check for personal data and the dependencies
+    - name: Check for personal data, keys and the dependencies
       id: prepare
       if: inputs.mode == 'prepare'
       shell: bash
@@ -35,19 +35,19 @@ runs:
         LOG_LEVEL: ${{ inputs.log_level }}
       run: bash "${{ github.action_path }}/scripts/prepare.sh"
 
+    - name: Fetch the Pippa SDK
+      if: inputs.mode == 'sdk-fetch'
+      shell: bash
+      env:
+        LOG_LEVEL: ${{ inputs.log_level }}
+      run: bash "${{ github.action_path }}/scripts/fetch-sdk.sh"
+
     - name: Install the Pippa SDK
-      if: inputs.mode == 'sdk'
+      if: inputs.mode == 'sdk-install'
       shell: bash
       env:
         LOG_LEVEL: ${{ inputs.log_level }}
       run: bash "${{ github.action_path }}/scripts/install-sdk.sh"
-
-    - name: Remove the credentials
-      if: inputs.mode == 'clear'
-      shell: bash
-      env:
-        LOG_LEVEL: ${{ inputs.log_level }}
-      run: bash "${{ github.action_path }}/scripts/clear-credentials.sh"
 
     - name: Check the app
       id: check

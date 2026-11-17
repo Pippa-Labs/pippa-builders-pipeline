@@ -16,23 +16,29 @@ concurrency:
   group: hack-publish-${{ github.repository }}
   cancel-in-progress: true
 
+# Only a push to main of a Pippa-Labs pippa-hack-* repository publishes: never another event,
+# branch, owner or repository, a fork, or one of the two templates. The `skipped` job says why
+# in the run summary when this does not hold.
+#
+# App code runs only in the check job, which has no credentials and no `id-token`. The SDK job
+# fetches the Pippa SDK with the SDK read role and hands the wheel over as a cache entry of this
+# run (an artifact of a public repository could be downloaded by anyone).
 jobs:
-  check:
-    name: Check
-    if: github.ref == 'refs/heads/main' && github.repository != 'Pippa-Labs/pippa-hack-template'
+  # Runs no app code: personal data, committed keys, nothing to publish yet, dependencies.
+  prepare:
+    name: Prepare
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'Pippa-Labs' && startsWith(github.event.repository.name, 'pippa-hack-') && !github.event.repository.fork && github.repository != 'Pippa-Labs/pippa-hack-template' && github.repository != 'Pippa-Labs/pippa-hack-template-public'
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 8
     permissions:
       contents: read
-      id-token: write
     outputs:
       ready: ${{ steps.prepare.outputs.ready }}
-      verdict: ${{ steps.prepare.outputs.verdict || steps.check.outputs.verdict }}
-      details: ${{ steps.prepare.outputs.details || steps.check.outputs.details }}
-      warnings: ${{ steps.check.outputs.warnings }}
-      prepare_warnings: ${{ steps.prepare.outputs.warnings }}
+      verdict: ${{ steps.prepare.outputs.verdict }}
+      details: ${{ steps.prepare.outputs.details }}
+      warnings: ${{ steps.prepare.outputs.warnings }}
     steps:
-      # The whole history: the personal data check reads the commits of the push.
+      # The whole history: the personal data and secret checks read the commits of the push.
       - name: Checkout the app
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -44,17 +50,38 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Everything up to "Remove the credentials" runs before any app code.
-      - name: Check for personal data and the dependencies
+      - name: Check for personal data, keys and the dependencies
         id: prepare
         uses: Pippa-Labs/pippa-builders-pipeline/.github/actions/hack-check@main
         with:
           mode: prepare
           log_level: ${{ inputs.log_level }}
 
-      - name: Get permission to install the Pippa SDK
-        id: aws
-        if: steps.prepare.outputs.ready == 'true' && steps.prepare.outputs.verdict != 'failed'
+      # The step above writes verdict=failed and succeeds, so its outputs always reach the job.
+      - name: Fail on a refusal
+        id: verdict
+        if: ${{ !cancelled() && steps.prepare.outputs.verdict == 'failed' }}
+        shell: bash
+        run: |
+          echo "::error::Something was refused; nothing is published"
+          exit 1
+
+  # Runs no app code and checks nothing out: the only job with the SDK read role.
+  sdk:
+    name: Fetch the Pippa SDK
+    needs: prepare
+    if: needs.prepare.outputs.ready == 'true' && needs.prepare.outputs.verdict != 'failed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Get permission to read the Pippa SDK
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::780886633355:role/PippaHackSdkReadRole
@@ -62,41 +89,77 @@ jobs:
           role-session-name: hack-sdk-${{ github.run_id }}
           role-duration-seconds: 900
 
-      - name: Install the Pippa SDK
-        if: steps.prepare.outputs.ready == 'true' && steps.prepare.outputs.verdict != 'failed'
+      - name: Fetch the Pippa SDK
         uses: Pippa-Labs/pippa-builders-pipeline/.github/actions/hack-check@main
         with:
-          mode: sdk
+          mode: sdk-fetch
           log_level: ${{ inputs.log_level }}
 
-      - name: Remove the credentials
-        if: ${{ always() && steps.prepare.outputs.ready == 'true' }}
+      - name: Hand the SDK over to the check job
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/hack-sdk-handover
+          key: pippa-hack-sdk-${{ github.run_id }}
+
+  # Runs the app's code: no credentials, no id-token.
+  check:
+    name: Check
+    needs: [prepare, sdk]
+    if: needs.sdk.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      contents: read
+    outputs:
+      verdict: ${{ steps.check.outputs.verdict }}
+      details: ${{ steps.check.outputs.details }}
+      warnings: ${{ steps.check.outputs.warnings }}
+    steps:
+      - name: Checkout the app
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Take the Pippa SDK from the SDK job
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/hack-sdk-handover
+          key: pippa-hack-sdk-${{ github.run_id }}
+          fail-on-cache-miss: true
+
+      # Everything up to here runs before any app code.
+      - name: Install the Pippa SDK
         uses: Pippa-Labs/pippa-builders-pipeline/.github/actions/hack-check@main
         with:
-          mode: clear
+          mode: sdk-install
           log_level: ${{ inputs.log_level }}
 
       - name: Check the app
         id: check
-        if: steps.prepare.outputs.ready == 'true' && steps.prepare.outputs.verdict != 'failed'
         uses: Pippa-Labs/pippa-builders-pipeline/.github/actions/hack-check@main
         with:
           mode: check
           log_level: ${{ inputs.log_level }}
 
-      # The steps above write verdict=failed and succeed, so their outputs always reach the job.
+      # The step above writes verdict=failed and succeeds, so its outputs always reach the job.
       - name: Fail on a code error
         id: verdict
-        if: ${{ !cancelled() && (steps.prepare.outputs.verdict == 'failed' || steps.check.outputs.verdict == 'failed') }}
+        if: ${{ !cancelled() && steps.check.outputs.verdict == 'failed' }}
         shell: bash
         run: |
           echo "::error::The check failed; nothing is published"
           exit 1
 
+  # Also after a failed prepare, SDK or check job, to report it on the commit.
   publish:
     name: Publish
-    needs: check
-    if: ${{ !cancelled() && needs.check.result != 'skipped' && needs.check.outputs.ready != 'false' }}
+    needs: [prepare, sdk, check]
+    if: ${{ !cancelled() && needs.prepare.result != 'skipped' && needs.prepare.outputs.ready != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: pippa-publish
@@ -129,10 +192,10 @@ jobs:
           mode: install
           log_level: ${{ inputs.log_level }}
 
-      # Also after a check that failed without a verdict (platform error), so the error is counted.
+      # Also after a job that failed without a verdict (platform error), so the error is counted.
       - name: Get permission to publish
         id: aws
-        if: ${{ !cancelled() && (needs.check.result == 'success' || (needs.check.result == 'failure' && needs.check.outputs.verdict != 'failed')) }}
+        if: ${{ !cancelled() && (needs.check.result == 'success' || needs.sdk.result == 'failure' || (needs.prepare.result == 'failure' && needs.prepare.outputs.verdict != 'failed') || (needs.check.result == 'failure' && needs.check.outputs.verdict != 'failed')) }}
         continue-on-error: true
         uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
@@ -147,14 +210,52 @@ jobs:
         with:
           mode: publish
           app_dir: app
-          check_result: ${{ needs.check.result }}
-          check_verdict: ${{ needs.check.outputs.verdict }}
-          check_details: ${{ needs.check.outputs.details }}
+          check_result: ${{ needs.prepare.result == 'success' && needs.check.result || 'failure' }}
+          check_verdict: ${{ needs.prepare.outputs.verdict || needs.check.outputs.verdict }}
+          check_details: ${{ needs.prepare.outputs.details || needs.check.outputs.details }}
           check_warnings: ${{ needs.check.outputs.warnings }}
-          prepare_warnings: ${{ needs.check.outputs.prepare_warnings }}
+          prepare_warnings: ${{ needs.prepare.outputs.warnings }}
           checkout: ${{ steps.checkout.outcome }}
           python: ${{ steps.python.outcome }}
           dependencies: ${{ steps.deps.outcome }}
           credentials: ${{ steps.aws.outcome }}
           token: ${{ github.token }}
           log_level: ${{ inputs.log_level }}
+
+  # The other side of the prepare job's condition: says in the run summary why nothing is published.
+  skipped:
+    name: Not published
+    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'Pippa-Labs' && startsWith(github.event.repository.name, 'pippa-hack-') && !github.event.repository.fork && github.repository != 'Pippa-Labs/pippa-hack-template' && github.repository != 'Pippa-Labs/pippa-hack-template-public') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Say why nothing is published
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          OWNER: ${{ github.repository_owner }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_NAME: ${{ github.event.repository.name }}
+          FORK: ${{ github.event.repository.fork }}
+        run: |
+          set -euo pipefail
+          plain() { local value="${1//[^A-Za-z0-9._\/-]/?}"; printf '%s' "${value:0:100}"; }
+          lower() { printf '%s' "${1,,}"; }
+          if [ "$EVENT_NAME" != "push" ]; then
+            reason="only a push to main publishes; this run was started by $(plain "$EVENT_NAME")."
+          elif [ "$(lower "$REF")" != "refs/heads/main" ]; then
+            reason="only a push to main publishes; this push was to $(plain "$REF")."
+          elif [ "$(lower "$OWNER")" != "pippa-labs" ]; then
+            reason="only repositories of Pippa-Labs publish; this one belongs to $(plain "$OWNER")."
+          elif [[ "$(lower "$REPOSITORY_NAME")" != pippa-hack-* ]]; then
+            reason="only pippa-hack-* app repositories publish; this is $(plain "$REPOSITORY_NAME")."
+          elif [ "$FORK" = "true" ]; then
+            reason="a fork never publishes; only the app repository Pippa Labs created does."
+          elif [ "$(lower "$REPOSITORY")" = "pippa-labs/pippa-hack-template" ] || [ "$(lower "$REPOSITORY")" = "pippa-labs/pippa-hack-template-public" ]; then
+            reason="this is the app template; the repositories created from it publish."
+          else
+            reason="this run does not meet the conditions for publishing."
+          fi
+          printf 'Not published: %s\n' "$reason" | tee -a "$GITHUB_STEP_SUMMARY"

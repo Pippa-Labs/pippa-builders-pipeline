@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Refuses personal data, decides whether there is an app to publish and refuses dependencies
-# that do not come from PyPI. Runs before any app code and before any AWS credentials exist
-# in the job.
+# The prepare job: refuses personal data and committed keys, decides whether there is an app to
+# publish and refuses dependencies that do not come from PyPI. Runs no app code, in a job that
+# has no credentials.
 #
-# The personal data check always runs, also on a push with nothing to publish yet: an email
-# address in a file, or on a commit of a public repository, is refused. A refusal there makes
-# the run ready anyway, so the publish job reports it on the commit. Commit emails of a private
+# The personal data check and the secret check always run, also on a push with nothing to
+# publish yet: an email address in a file, or on a commit of a public repository, is refused,
+# and so is a value that looks like a key (secret_scan.py, gitleaks). A refusal there makes the
+# run ready anyway, so the publish job reports it on the commit. Commit emails of a private
 # repository are warnings.
 #
 # Outputs: ready; verdict=failed/details when something is refused; warnings. A refusal
@@ -28,6 +29,7 @@ source "${ACTION_DIR}/scripts/verdict.sh"
 
 APP_DIR="${GITHUB_WORKSPACE:-$PWD}"
 WARNINGS_FILE="${RUNNER_TEMP}/hack-prepare-warnings.txt"
+SECRETS_WORK_DIR="${RUNNER_TEMP}/hack-secrets"
 FAILURES=""
 REASONS=""
 
@@ -55,6 +57,31 @@ check_personal_data() {
       ;;
     *)
       log_error "The personal data check could not run (exit ${status})"
+      exit 1
+      ;;
+  esac
+}
+
+# HACK_GITLEAKS_BIN replaces the pinned gitleaks download in tests, never in GitHub Actions.
+check_secrets() {
+  local findings status=0
+  local args=("--app-dir=${APP_DIR}" "--work-dir=${SECRETS_WORK_DIR}")
+  if [ "${GITHUB_ACTIONS:-}" != "true" ] && [ -n "${HACK_GITLEAKS_BIN:-}" ]; then
+    args+=("--gitleaks=${HACK_GITLEAKS_BIN}")
+  fi
+  findings="$(python -I "${HACK_DIR}/secret_scan.py" "${args[@]}")" || status=$?
+  rm -rf "$SECRETS_WORK_DIR"
+  case "$status" in
+    0)
+      log_info "No committed keys found"
+      ;;
+    1)
+      printf '%s\n' "$findings"
+      add_failures "$findings"
+      log_warn "A value that looks like a key was committed; the job fails at its last step"
+      ;;
+    *)
+      log_error "The secret check could not run (exit ${status})"
       exit 1
       ;;
   esac
@@ -100,6 +127,7 @@ write_warnings() {
 
 main() {
   check_personal_data
+  check_secrets
   read_reasons
   write_warnings
 
@@ -114,7 +142,7 @@ main() {
   if [ -z "$REASONS" ]; then
     check_dependencies
   else
-    log_warn "Nothing to publish yet, but personal data was found; it is reported on the commit"
+    log_warn "Nothing to publish yet, but something was refused; it is reported on the commit"
   fi
   if [ -n "$FAILURES" ]; then
     verdict_failed "$FAILURES"

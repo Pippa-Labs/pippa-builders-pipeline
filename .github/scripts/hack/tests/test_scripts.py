@@ -1,12 +1,15 @@
-"""Runs the hack-check and hack-publish scripts with stubbed gh, aws and pip."""
+"""Runs the hack-check and hack-publish scripts, and the skipped job's step, with stubbed gh, aws, gitleaks and pip."""
 
 import json
 import os
 import shutil
 import subprocess
 
-from conftest import (CHECK_ACTION_DIR, MANIFEST, PLACEHOLDER, PUBLISH_ACTION_DIR, base_env, make_app, read,
-                      write_exec)
+import pytest
+import yaml
+
+from conftest import (CHECK_ACTION_DIR, MANIFEST, PLACEHOLDER, PUBLISH_ACTION_DIR, REPO, base_env, make_app,
+                      read, write_exec)
 
 SHA = "a" * 64
 PARAMETER = json.dumps({
@@ -224,23 +227,28 @@ def test_prepare_personal_data_check_crash_fails_without_verdict(tmp_path, bin_d
     assert "The personal data check could not run (exit 2)" in result.stderr
 
 
-# ---- install-sdk ----
+# ---- fetch-sdk (the SDK job) ----
 
-def run_install(tmp_path, bin_dir, **extra):
+def run_fetch(tmp_path, bin_dir, **extra):
     app = make_app(tmp_path)
     env = {"STUB_PIP": "1", "STUB_PARAMETER": PARAMETER,
            "PIP_EXTRA_INDEX_URL": "https://evil.example/simple"}
     env.update(extra)
-    result, _, _ = run_check_script(tmp_path, bin_dir, app, "install-sdk.sh", **env)
+    result, _, _ = run_check_script(tmp_path, bin_dir, app, "fetch-sdk.sh", **env)
     return result, read(tmp_path / "calls.log")
 
 
-def test_install_sdk_uses_only_the_sdk_repository_with_pin_and_hash(tmp_path, bin_dir):
-    result, calls = run_install(tmp_path, bin_dir)
+HANDOVER = "hack-sdk-handover"
+
+
+def test_fetch_sdk_downloads_only_from_the_sdk_repository_with_pin_and_hash(tmp_path, bin_dir):
+    result, calls = run_fetch(tmp_path, bin_dir)
     assert result.returncode == 0, result.stderr
     pip = next(line for line in calls.splitlines() if line.startswith("pip "))
+    assert pip.startswith("pip download ")
     assert "--index-url https://aws:tok-secret-value@pippa-780886633355.d.codeartifact.eu-west-2.amazonaws.com" \
            "/pypi/pippa-prod-codeartifact-euw2-hack-sdk/simple/" in pip
+    assert f"--dest {tmp_path / 'runner' / HANDOVER}" in pip
     assert "extra-index-url" not in pip
     for flag in ("--no-deps", "--require-hashes", "--only-binary :all:", "--no-cache-dir"):
         assert flag in pip
@@ -251,10 +259,21 @@ def test_install_sdk_uses_only_the_sdk_repository_with_pin_and_hash(tmp_path, bi
     assert f"CWD={tmp_path / 'runner' / 'hack-sdk'}" in calls
 
 
+def test_fetch_sdk_hands_over_the_pin_and_one_wheel_and_nothing_else(tmp_path, bin_dir):
+    result, _ = run_fetch(tmp_path, bin_dir)
+    assert result.returncode == 0, result.stderr
+    handover = tmp_path / "runner" / HANDOVER
+    assert sorted(path.name for path in handover.iterdir()) == ["pippa_agentapp_sdk-0.1.3-py3-none-any.whl", "sdk.txt"]
+    assert (handover / "sdk.txt").read_text() == f"pippa-agentapp-sdk==0.1.3 --hash=sha256:{SHA}\n"
+    assert not (tmp_path / "runner" / "hack-sdk").exists()
+    assert list((tmp_path / "home").iterdir()) == []
+    assert "tok-secret-value" not in "".join(path.read_text(errors="replace") for path in handover.iterdir())
+
+
 PLANTED_PIP = "open({marker!r}, 'w').write('planted pip ran')\n"
 
 
-def test_planted_pip_in_the_app_never_runs_while_credentials_exist(tmp_path, bin_dir):
+def test_planted_pip_in_the_current_directory_never_runs_while_credentials_exist(tmp_path, bin_dir):
     app = make_app(tmp_path)
     marker = tmp_path / "planted.txt"
     (app / "pip").mkdir()
@@ -267,7 +286,7 @@ def test_planted_pip_in_the_app_never_runs_while_credentials_exist(tmp_path, bin
     marker.unlink()
 
     result, _, _ = run_check_script(
-        tmp_path, bin_dir, app, "install-sdk.sh", STUB_PARAMETER=PARAMETER,
+        tmp_path, bin_dir, app, "fetch-sdk.sh", STUB_PARAMETER=PARAMETER,
         STUB_ENDPOINT="https://127.0.0.1:9/pypi/sdk/", PIP_RETRIES="0", PIP_TIMEOUT="2",
     )
     assert result.returncode != 0
@@ -275,8 +294,8 @@ def test_planted_pip_in_the_app_never_runs_while_credentials_exist(tmp_path, bin
     assert "tok-secret-value" not in result.stderr
 
 
-def test_install_sdk_token_is_short_lived_and_masked(tmp_path, bin_dir):
-    result, calls = run_install(tmp_path, bin_dir)
+def test_fetch_sdk_token_is_short_lived_and_masked(tmp_path, bin_dir):
+    result, calls = run_fetch(tmp_path, bin_dir)
     assert "--duration-seconds 900" in calls
     assert "--domain pippa --domain-owner 780886633355" in calls
     assert "--name /pippa/prod/hack/sdk" in calls
@@ -284,61 +303,97 @@ def test_install_sdk_token_is_short_lived_and_masked(tmp_path, bin_dir):
     assert "tok-secret-value" not in result.stderr
 
 
-def test_install_sdk_leaves_no_files(tmp_path, bin_dir):
-    result, _ = run_install(tmp_path, bin_dir)
-    assert result.returncode == 0
-    assert not (tmp_path / "runner" / "hack-sdk").exists()
-    assert list((tmp_path / "home").iterdir()) == []
-
-
-def test_install_sdk_bad_parameter_fails_before_any_token(tmp_path, bin_dir):
-    result, calls = run_install(tmp_path, bin_dir, STUB_PARAMETER='{"version": "0.1.3"}')
+def test_fetch_sdk_bad_parameter_fails_before_any_token(tmp_path, bin_dir):
+    result, calls = run_fetch(tmp_path, bin_dir, STUB_PARAMETER='{"version": "0.1.3"}')
     assert result.returncode != 0
     assert "get-authorization-token" not in calls
     assert "pip " not in calls
     assert not (tmp_path / "runner" / "hack-sdk").exists()
+    assert not (tmp_path / "runner" / HANDOVER).exists()
 
 
-def test_install_sdk_token_failure_fails(tmp_path, bin_dir):
-    result, calls = run_install(tmp_path, bin_dir, STUB_AWS_FAIL="get-authorization-token")
+def test_fetch_sdk_token_failure_fails(tmp_path, bin_dir):
+    result, calls = run_fetch(tmp_path, bin_dir, STUB_AWS_FAIL="get-authorization-token")
+    assert result.returncode != 0
+    assert "pip " not in calls
+    assert not (tmp_path / "runner" / HANDOVER).exists()
+
+
+def test_fetch_sdk_empty_token_fails(tmp_path, bin_dir):
+    result, calls = run_fetch(tmp_path, bin_dir, STUB_TOKEN="")
     assert result.returncode != 0
     assert "pip " not in calls
 
 
-def test_install_sdk_empty_token_fails(tmp_path, bin_dir):
-    result, calls = run_install(tmp_path, bin_dir, STUB_TOKEN="")
-    assert result.returncode != 0
-    assert "pip " not in calls
-
-
-def test_install_sdk_pip_failure_fails_and_cleans_up(tmp_path, bin_dir):
-    result, _ = run_install(tmp_path, bin_dir, STUB_PIP_EXIT="1")
+def test_fetch_sdk_pip_failure_fails_and_cleans_up(tmp_path, bin_dir):
+    result, _ = run_fetch(tmp_path, bin_dir, STUB_PIP_EXIT="1")
     assert result.returncode != 0
     assert "tok-secret-value" not in result.stderr
     assert not (tmp_path / "runner" / "hack-sdk").exists()
+    assert not (tmp_path / "runner" / HANDOVER).exists()
 
 
-# ---- clear-credentials ----
+def test_fetch_sdk_without_a_wheel_fails(tmp_path, bin_dir):
+    result, _ = run_fetch(tmp_path, bin_dir, STUB_PIP_NO_WHEEL="1")
+    assert result.returncode != 0
+    assert "Expected sdk.txt and one SDK wheel to hand over, found 1 file(s)" in result.stderr
+    assert not (tmp_path / "runner" / HANDOVER).exists()
 
-def test_clear_blanks_credentials_and_removes_leftovers(tmp_path, bin_dir):
+
+# ---- install-sdk (the check job) ----
+
+PIN = f"pippa-agentapp-sdk==0.1.3 --hash=sha256:{SHA}\n"
+
+
+def run_install(tmp_path, bin_dir, pin=PIN, wheel=True, **extra):
     app = make_app(tmp_path)
-    home = tmp_path / "home"
-    (home / ".config" / "pip").mkdir(parents=True)
-    leaked = home / ".config" / "pip" / "pip.conf"
-    leaked.write_text("[global]\nindex-url = https://aws:x@pippa-1.d.codeartifact.eu-west-2.amazonaws.com/\n")
-    (home / ".pip").mkdir()
-    kept = home / ".pip" / "pip.conf"
-    kept.write_text("[global]\ntimeout = 60\n")
-    (tmp_path / "runner" / "hack-sdk").mkdir(parents=True)
-    result, _, _ = run_check_script(tmp_path, bin_dir, app, "clear-credentials.sh",
-                                    AWS_ACCESS_KEY_ID="AKIA", AWS_SECRET_ACCESS_KEY="s", AWS_SESSION_TOKEN="t")
+    handover = tmp_path / "runner" / HANDOVER
+    handover.mkdir(parents=True)
+    if pin is not None:
+        (handover / "sdk.txt").write_text(pin)
+    if wheel:
+        (handover / "pippa_agentapp_sdk-0.1.3-py3-none-any.whl").write_bytes(b"PK")
+    env = {"STUB_PIP": "1", "PIP_EXTRA_INDEX_URL": "https://evil.example/simple"}
+    env.update(extra)
+    result, _, _ = run_check_script(tmp_path, bin_dir, app, "install-sdk.sh", **env)
+    return result, read(tmp_path / "calls.log"), handover
+
+
+def test_install_sdk_installs_the_handed_over_wheel_offline_with_its_hash(tmp_path, bin_dir):
+    result, calls, handover = run_install(tmp_path, bin_dir)
     assert result.returncode == 0, result.stderr
-    lines = read(tmp_path / "env.txt").splitlines()
-    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN"):
-        assert f"{name}=" in lines
-    assert not leaked.exists()
-    assert kept.exists()
-    assert not (tmp_path / "runner" / "hack-sdk").exists()
+    pip = next(line for line in calls.splitlines() if line.startswith("pip "))
+    assert pip.startswith("pip install ")
+    assert f"--no-index --find-links {handover}" in pip
+    for flag in ("--no-deps", "--require-hashes", "--only-binary :all:", "--no-cache-dir"):
+        assert flag in pip
+    assert "index-url" not in pip
+    assert f"REQUIREMENTS {PIN.strip()}" in calls
+    assert "PIP_CONFIG_FILE=/dev/null" in calls and "PIP_EXTRA_INDEX_URL=unset" in calls
+    assert "FLAGS=-I" in calls
+    assert f"CWD={handover}" in calls
+    assert not handover.exists()
+    assert "aws " not in calls
+
+
+@pytest.mark.parametrize("pin", [
+    None,
+    "pippa-agentapp-sdk==0.1.3\n",
+    f"pippa-agentapp-sdk==0.1.3 --hash=sha256:{SHA}\n--extra-index-url https://evil.example/simple\n",
+    f"evil-package==1.0 --hash=sha256:{SHA}\n",
+    f"pippa-agentapp-sdk==0.1.3 --hash=sha256:{SHA} --index-url https://evil.example/\n",
+])
+def test_install_sdk_refuses_anything_but_one_hash_locked_sdk_requirement(tmp_path, bin_dir, pin):
+    result, calls, handover = run_install(tmp_path, bin_dir, pin=pin)
+    assert result.returncode == 1
+    assert "pip " not in calls
+    assert not handover.exists()
+
+
+def test_install_sdk_pip_failure_fails_and_cleans_up(tmp_path, bin_dir):
+    result, _, handover = run_install(tmp_path, bin_dir, STUB_PIP_EXIT="1")
+    assert result.returncode != 0
+    assert not handover.exists()
 
 
 # ---- check-app ----
@@ -429,6 +484,16 @@ def test_check_refuses_to_run_app_code_with_credentials(tmp_path, bin_dir):
     result, output, _ = run_check_script(tmp_path, bin_dir, app, "check-app.sh", AWS_SESSION_TOKEN="t")
     assert result.returncode == 1
     assert "verdict" not in output
+    assert not (app / "ran").exists()
+
+
+@pytest.mark.parametrize("name", ["ACTIONS_ID_TOKEN_REQUEST_URL", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"])
+def test_check_refuses_to_run_app_code_where_it_could_request_an_oidc_token(tmp_path, bin_dir, name):
+    app = make_app(tmp_path, check_body="open('ran', 'w').write('x')")
+    result, output, _ = run_check_script(tmp_path, bin_dir, app, "check-app.sh", **{name: "https://token.example"})
+    assert result.returncode == 1
+    assert "verdict" not in output
+    assert f"{name} is set; the app's code never runs in a job that can request an OIDC token" in result.stderr
     assert not (app / "ran").exists()
 
 
@@ -577,3 +642,117 @@ def test_publish_with_only_personal_data_warnings(tmp_path, bin_dir):
                 PREPARE_WARNINGS=" WARN commit 1234567 (author): z", CHECKOUT_OUTCOME="skipped",
                 DEPENDENCIES_OUTCOME="skipped", CREDENTIALS="skipped")
     assert read(tmp_path / "runner" / "hack-check-warnings.txt") == "Personal data\n WARN commit 1234567 (author): z"
+
+
+# ---- prepare: committed keys (gitleaks stubbed; secret_scan.py has its own tests) ----
+
+KEY_FINDING = json.dumps([{"RuleID": "generic-api-key", "File": "weather.py", "StartLine": 4, "Commit": "",
+                           "Secret": "REDACTED", "Match": "REDACTED"}])
+
+
+def test_prepare_runs_the_secret_check_on_every_push(tmp_path, bin_dir):
+    app = make_app(tmp_path)
+    result, output, _ = run_check_script(tmp_path, bin_dir, app, "prepare.sh")
+    assert result.returncode == 0, result.stderr
+    assert "ready=true" in output and "verdict" not in output
+    gitleaks = next(line for line in read(tmp_path / "calls.log").splitlines() if line.startswith("gitleaks "))
+    assert gitleaks.startswith("gitleaks dir ") and "--redact" in gitleaks
+    assert not (tmp_path / "runner" / "hack-secrets").exists()
+
+
+def test_prepare_refuses_a_committed_key_as_a_code_error(tmp_path, bin_dir):
+    app = make_app(tmp_path)
+    result, output, _ = run_check_script(tmp_path, bin_dir, app, "prepare.sh",
+                                         STUB_GITLEAKS_REPORT=KEY_FINDING, STUB_GITLEAKS_EXIT="3")
+    assert result.returncode == 0, result.stderr
+    assert "ready=true" in output and output.count("verdict=failed") == 1
+    details = output_value(output, "details")
+    assert details.startswith(" FAIL a value that looks like a key was committed in weather.py:4 (gitleaks rule "
+                              "generic-api-key); remove it, rotate the key, use app_secrets\n")
+    assert "Rotate the key at its provider first" in details
+    assert not (tmp_path / "runner" / "hack-secrets").exists()
+
+
+def test_prepare_reports_a_committed_key_even_with_nothing_to_publish(tmp_path, bin_dir):
+    app = make_app(tmp_path, manifest=PLACEHOLDER)
+    result, output, summary = run_check_script(tmp_path, bin_dir, app, "prepare.sh",
+                                               STUB_GITLEAKS_REPORT=KEY_FINDING, STUB_GITLEAKS_EXIT="3")
+    assert result.returncode == 0, result.stderr
+    assert "ready=true" in output and "verdict=failed" in output
+    assert "Nothing to publish yet" not in summary
+
+
+def test_prepare_lists_personal_data_and_a_committed_key_together(tmp_path, bin_dir):
+    app = make_app(tmp_path)
+    (app / "notes.md").write_text(f"Ask {PERSONAL}\n")
+    result, output, _ = run_check_script(tmp_path, bin_dir, app, "prepare.sh",
+                                         STUB_GITLEAKS_REPORT=KEY_FINDING, STUB_GITLEAKS_EXIT="3")
+    details = output_value(output, "details")
+    assert " FAIL notes.md:1 contains the email address" in details
+    assert " FAIL a value that looks like a key was committed in weather.py:4" in details
+
+
+def test_prepare_secret_check_crash_fails_without_verdict(tmp_path, bin_dir):
+    app = make_app(tmp_path)
+    result, output, _ = run_check_script(tmp_path, bin_dir, app, "prepare.sh", STUB_GITLEAKS_EXIT="1")
+    assert result.returncode == 1
+    assert "verdict" not in output and "ready" not in output
+    assert "The secret check could not run (exit 2)" in result.stderr
+
+
+def test_prepare_uses_a_test_gitleaks_only_outside_github_actions():
+    script = (CHECK_ACTION_DIR / "scripts" / "prepare.sh").read_text()
+    assert 'if [ "${GITHUB_ACTIONS:-}" != "true" ] && [ -n "${HACK_GITLEAKS_BIN:-}" ]; then' in script
+
+
+# ---- the skipped job: why nothing is published ----
+
+GUARD = ("github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository_owner == 'Pippa-Labs' "
+         "&& startsWith(github.event.repository.name, 'pippa-hack-') && !github.event.repository.fork "
+         "&& github.repository != 'Pippa-Labs/pippa-hack-template' "
+         "&& github.repository != 'Pippa-Labs/pippa-hack-template-public'")
+PUSHED = {"EVENT_NAME": "push", "REF": "refs/heads/main", "OWNER": "Pippa-Labs",
+          "REPOSITORY": "Pippa-Labs/pippa-hack-smoke", "REPOSITORY_NAME": "pippa-hack-smoke", "FORK": "false"}
+
+
+def skipped_reason(tmp_path, **changes):
+    workflow = yaml.safe_load((REPO / ".github" / "workflows" / "reusable-hack-publish.yml").read_text())
+    step = workflow["jobs"]["skipped"]["steps"][0]
+    summary = tmp_path / "skipped-summary.md"
+    summary.write_text("")
+    env = {"PATH": os.environ["PATH"], "GITHUB_STEP_SUMMARY": str(summary), **PUSHED, **changes}
+    result = subprocess.run(["bash", "-c", step["run"]], env=env, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return summary.read_text()
+
+
+@pytest.mark.parametrize("changes, reason", [
+    ({"EVENT_NAME": "workflow_dispatch"}, "only a push to main publishes; this run was started by workflow_dispatch."),
+    ({"EVENT_NAME": "pull_request", "REF": "refs/pull/1/merge"},
+     "only a push to main publishes; this run was started by pull_request."),
+    ({"REF": "refs/heads/feature"}, "only a push to main publishes; this push was to refs/heads/feature."),
+    ({"OWNER": "someone-else", "REPOSITORY": "someone-else/pippa-hack-smoke"},
+     "only repositories of Pippa-Labs publish; this one belongs to someone-else."),
+    ({"REPOSITORY_NAME": "pippa_agent", "REPOSITORY": "Pippa-Labs/pippa_agent"},
+     "only pippa-hack-* app repositories publish; this is pippa_agent."),
+    ({"FORK": "true"}, "a fork never publishes; only the app repository Pippa Labs created does."),
+    ({"REPOSITORY": "Pippa-Labs/pippa-hack-template", "REPOSITORY_NAME": "pippa-hack-template"},
+     "this is the app template; the repositories created from it publish."),
+    ({"REPOSITORY": "Pippa-Labs/pippa-hack-template-public", "REPOSITORY_NAME": "pippa-hack-template-public"},
+     "this is the app template; the repositories created from it publish."),
+    ({}, "this run does not meet the conditions for publishing."),
+])
+def test_the_skipped_job_writes_one_line_saying_why(tmp_path, changes, reason):
+    assert skipped_reason(tmp_path, **changes) == f"Not published: {reason}\n"
+
+
+def test_the_skipped_job_never_echoes_markup_from_a_ref(tmp_path):
+    summary = skipped_reason(tmp_path, REF="refs/heads/<img src=x>`$(id)`")
+    assert summary == "Not published: only a push to main publishes; this push was to refs/heads/?img?src?x????id??.\n"
+
+
+def test_the_skipped_job_runs_exactly_when_prepare_does_not():
+    workflow = yaml.safe_load((REPO / ".github" / "workflows" / "reusable-hack-publish.yml").read_text())
+    assert workflow["jobs"]["prepare"]["if"] == GUARD
+    assert workflow["jobs"]["skipped"]["if"] == f"${{{{ !({GUARD}) }}}}"
+    assert workflow["jobs"]["skipped"]["permissions"] == {}

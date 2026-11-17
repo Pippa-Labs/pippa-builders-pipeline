@@ -1,4 +1,4 @@
-"""Shared fixtures: stubbed gh, aws and python on PATH, and the Actions environment."""
+"""Shared fixtures: stubbed gh, aws, gitleaks and python on PATH, and the Actions environment."""
 
 import os
 import shutil
@@ -29,9 +29,13 @@ if [ "${1:-}" = "-m" ] && [ "${2:-}" = "pip" ] && [ -n "${STUB_PIP:-}" ]; then
     prev=""
     for a in "$@"; do
       if [ "$prev" = "-r" ]; then echo "REQUIREMENTS $(cat "$a")"; fi
+      if [ "$prev" = "--dest" ]; then dest="$a"; fi
       prev="$a"
     done
   } >> "$CALLS"
+  if [ -n "${dest:-}" ] && [ "${STUB_PIP_EXIT:-0}" = "0" ] && [ -z "${STUB_PIP_NO_WHEEL:-}" ]; then
+    printf 'PK' > "${dest}/pippa_agentapp_sdk-0.1.3-py3-none-any.whl"
+  fi
   exit "${STUB_PIP_EXIT:-0}"
 fi
 exec PYTHON "$@"
@@ -45,6 +49,14 @@ case "$1 $2" in
   "codeartifact get-repository-endpoint") echo "${STUB_ENDPOINT:-https://pippa-780886633355.d.codeartifact.eu-west-2.amazonaws.com/pypi/pippa-prod-codeartifact-euw2-hack-sdk/}" ;;
   "codeartifact get-authorization-token") echo "${STUB_TOKEN-tok-secret-value}" ;;
 esac
+"""
+
+#: Writes STUB_GITLEAKS_REPORT (default: no findings) as the report and exits STUB_GITLEAKS_EXIT.
+GITLEAKS_STUB = """#!/usr/bin/env bash
+echo "gitleaks $*" >> "$CALLS"
+for a in "$@"; do case "$a" in --report-path=*) report="${a#--report-path=}";; esac; done
+printf '%s' "${STUB_GITLEAKS_REPORT:-[]}" > "$report"
+exit "${STUB_GITLEAKS_EXIT:-0}"
 """
 
 
@@ -67,6 +79,7 @@ def bin_dir(tmp_path):
         "for a in \"$@\"; do case \"$a\" in *.json) cat \"$a\" >> " + str(calls) + "; echo >> " + str(calls) + ";; esac; done\n"
     ))
     write_exec(bindir / "aws", AWS_STUB)
+    write_exec(bindir / "gitleaks", GITLEAKS_STUB)
     return bindir
 
 
@@ -91,6 +104,7 @@ def base_env(tmp_path, bindir):
         "GITHUB_RUN_ATTEMPT": "1",
         "GITHUB_SERVER_URL": "https://github.com",
         "GITHUB_ACTIONS": "false",
+        "HACK_GITLEAKS_BIN": str(bindir / "gitleaks"),
     }
     for name in ("output.txt", "env.txt", "summary.md"):
         (tmp_path / name).write_text("")

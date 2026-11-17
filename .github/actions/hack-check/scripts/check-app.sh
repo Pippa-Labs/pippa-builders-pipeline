@@ -20,6 +20,8 @@ source "${COMMON_DIR}/error-handler.sh"
 source "${ACTION_DIR}/scripts/verdict.sh"
 
 CREDENTIAL_VARIABLES=(AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_SECURITY_TOKEN)
+# Set only in a job with `id-token: write`; the app's code never runs in one.
+OIDC_VARIABLES=(ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_ID_TOKEN_REQUEST_TOKEN)
 INSTALL_TIMEOUT=240
 CHECK_TIMEOUT=300
 ROUTING_TIMEOUT=60
@@ -35,6 +37,12 @@ require_no_credentials() {
       exit 1
     fi
     unset "$name"
+  done
+  for name in "${OIDC_VARIABLES[@]}"; do
+    if [ -n "${!name:-}" ]; then
+      log_error "${name} is set; the app's code never runs in a job that can request an OIDC token"
+      exit 1
+    fi
   done
 }
 
