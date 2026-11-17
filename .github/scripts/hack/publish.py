@@ -109,11 +109,17 @@ IDENTITY_REFUSALS = {
         "Ask an organiser to finish setting up this repository. Changing the code will not help.",
     ),
 }
-#: Sentences that name an identity refusal, for a publisher that relays the sentence without the `reason`.
+#: How each identity refusal's sentence starts. The publisher relays the runtime's sentence as
+#: `error` and does not send the `reason`, so this is how a refusal is recognised today. The
+#: runtime's sentences live in pippa_agentapp_runtime/deploys.py; the event refusal is also
+#: the publisher's own. Compared after curly apostrophes are made straight.
 IDENTITY_SENTENCES = (
     ("Only the builder this repository belongs to can publish it", "actor_not_builder"),
     ("Only a push to main publishes", "not_a_push"),
+    ("This publish used a GitHub sign-in token that had already been used", "token_replayed"),
+    ("Pippa doesn't know which GitHub account this repository belongs to", "builder_identity_unknown"),
 )
+CURLY_APOSTROPHE = "\N{RIGHT SINGLE QUOTATION MARK}"
 #: A runtime warning about an API key the app declares but its builder has not added yet, e.g.
 #: "Published, but it can't run until you add OPENWEATHER_API_KEY in Created by me."
 KEYS_MISSING = re.compile(r"\b(?:can[\u2019']?t|cannot|can not)\s+run\s+until\s+you\s+add\b", re.IGNORECASE)
@@ -190,7 +196,7 @@ def identity_reason(reply: dict[str, Any]) -> str:
         value = reply.get(name)
         if isinstance(value, str) and value.strip() in IDENTITY_REFUSALS:
             return value.strip()
-    sentence = str(reply.get("error") or "").strip()
+    sentence = str(reply.get("error") or "").strip().replace(CURLY_APOSTROPHE, "'")
     return next((reason for start, reason in IDENTITY_SENTENCES if sentence.startswith(start)), "")
 
 

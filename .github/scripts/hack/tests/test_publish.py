@@ -700,6 +700,40 @@ def test_the_actor_refusal_is_recognised_by_its_sentence_alone(app):
     assert "Push from the GitHub account Pippa Labs invited to this repository." in body
 
 
+#: The runtime's sentences as the publisher relays them in `error` (it sends no `reason`).
+RUNTIME_SENTENCES = {
+    "token_replayed": ("This publish used a GitHub sign-in token that had already been used, so it was refused. "
+                       "Each run can publish once: push again to publish."),
+    "builder_identity_unknown": ("Pippa doesn't know which GitHub account this repository belongs to yet, so it "
+                                 "can't check who pushed."),
+    "actor_not_builder": ACTOR_SENTENCE,
+    "not_a_push": "Only a push to main publishes; this run was workflow_dispatch.",
+}
+
+
+@pytest.mark.parametrize("reason", sorted(RUNTIME_SENTENCES))
+@pytest.mark.parametrize("error_kind", [None, "refused"])
+def test_every_identity_refusal_is_recognised_by_the_runtimes_sentence_alone(app, reason, error_kind):
+    reply = {"statusCode": 403, "ok": False, "error_class": "code", "error": RUNTIME_SENTENCES[reason]}
+    if error_kind:
+        reply["error_kind"] = error_kind
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    outcome = run.execute(hp.CheckState())
+    assert outcome.kind == "refused" and outcome.reason == reason
+    body = outcome.comment_payload()["body"]
+    assert f"```text\n{RUNTIME_SENTENCES[reason]}\n```" in body
+    assert hp.IDENTITY_REFUSALS[reason].next_step in body
+
+
+def test_a_curly_apostrophe_in_the_sentence_still_names_the_refusal():
+    sentence = RUNTIME_SENTENCES["builder_identity_unknown"].replace("'", "\N{RIGHT SINGLE QUOTATION MARK}")
+    assert hp.identity_reason({"error": sentence}) == "builder_identity_unknown"
+
+
+def test_a_sentence_that_only_mentions_a_token_is_not_an_identity_refusal():
+    assert hp.identity_reason({"error": "The GitHub sign-in token could not be verified."}) == ""
+
+
 def test_the_publishers_own_event_refusal_is_recognised_by_its_sentence(app):
     reply = {"statusCode": 403, "ok": False, "error_class": "code",
              "error": "Only a push to main publishes; this run was workflow_dispatch"}
