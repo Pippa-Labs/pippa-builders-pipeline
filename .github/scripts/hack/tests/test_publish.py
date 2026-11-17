@@ -82,7 +82,8 @@ class FakeToken(hp.TokenProvider):
         self.audiences.append(audience)
         if self.exc:
             raise self.exc
-        return "jwt"
+        # A new value per request, as GitHub's: "jwt", then "jwt-2", "jwt-3", ...
+        return "jwt" if len(self.audiences) == 1 else f"jwt-{len(self.audiences)}"
 
 
 def make_run(app_dir, client=None, token=None):
@@ -394,7 +395,7 @@ def test_throttle_exhausted_is_infra(app):
 def test_throttle_backoff_doubles():
     delays = []
     client = FakeClient(json.dumps(SUCCESS).encode(), failures=[throttle(), throttle()])
-    hp.LambdaPublisher(client=client, sleep=delays.append).publish({"x": 1})
+    hp.LambdaPublisher(client=client, sleep=delays.append).publish(lambda: {"x": 1})
     assert delays == [2.0, 4.0]
 
 
@@ -606,3 +607,181 @@ def test_runtime_warnings_are_one_line_each_counted_and_cut():
     assert len(published.runtime_warnings) == hp.RUNTIME_WARNINGS_COUNT
     assert published.runtime_warnings[0] == "two lines"
     assert len(published.runtime_warnings[1]) == hp.RUNTIME_WARNING_LIMIT
+
+
+# ---- every attempt carries its own token: the publisher refuses a token it has seen ----
+
+def test_a_throttled_invoke_is_retried_with_a_fresh_token(app):
+    client = FakeClient(json.dumps(SUCCESS).encode(), failures=[throttle(), throttle()])
+    token = FakeToken()
+    run, _ = make_run(app, client, token)
+    assert run.execute(hp.CheckState()).kind == "success"
+    tokens = [json.loads(call["Payload"])["token"] for call in client.calls]
+    assert tokens == ["jwt", "jwt-2", "jwt-3"]
+    assert token.audiences == ["pippa-hackathon"] * 3
+    events = [json.loads(call["Payload"]) for call in client.calls]
+    assert all(event["code_zip_b64"] == events[0]["code_zip_b64"] for event in events)
+
+
+def test_a_failure_that_is_not_retried_requests_one_token(app):
+    error = ClientError({"Error": {"Code": "ResourceNotFoundException", "Message": "x"}}, "Invoke")
+    token = FakeToken()
+    run, client = make_run(app, FakeClient(failures=[error]), token)
+    assert run.execute(hp.CheckState()).kind == "infra"
+    assert len(token.audiences) == 1 and len(client.calls) == 1
+
+
+def test_a_token_failure_on_a_retry_is_a_platform_error(app):
+    class FailsSecond(FakeToken):
+        def token(self, audience):
+            if self.audiences:
+                self.audiences.append(audience)
+                raise hp.PlatformError("token endpoint down")
+            return super().token(audience)
+
+    client = FakeClient(json.dumps(SUCCESS).encode(), failures=[throttle()])
+    run, _ = make_run(app, client, FailsSecond())
+    assert run.execute(hp.CheckState()).kind == "infra"
+    assert len(client.calls) == 1
+
+
+def test_the_publisher_never_reuses_an_event():
+    built = []
+
+    def make_event():
+        built.append({"token": f"t{len(built)}"})
+        return built[-1]
+
+    client = FakeClient(json.dumps(SUCCESS).encode(), failures=[throttle()])
+    hp.LambdaPublisher(client=client, sleep=lambda _: None).publish(make_event)
+    assert [json.loads(call["Payload"]) for call in client.calls] == [{"token": "t0"}, {"token": "t1"}]
+
+
+# ---- refusals of the run itself: who pushed, a replayed token, not a push ----
+
+ACTOR_SENTENCE = ("Only the builder this repository belongs to can publish it. "
+                  "This push was made by tide-watcher-2.")
+
+
+@pytest.mark.parametrize("reason", sorted(hp.IDENTITY_REFUSALS))
+def test_identity_refusals_are_refusals_with_what_to_do(app, reason):
+    reply = {"statusCode": 403, "ok": False, "error_class": "code", "error": "Pippa's own sentence.",
+             "reason": reason}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    outcome = run.execute(hp.CheckState())
+    assert outcome.kind == "refused" and outcome.reason == reason
+    body = outcome.comment_payload()["body"]
+    assert body.startswith("REFUSED: the app was not published:\n\n```text\nPippa's own sentence.\n```")
+    assert hp.IDENTITY_REFUSALS[reason].next_step in body
+    assert f"(Reason: {reason})" in body
+    assert "CODE_ERROR" not in body and "problem in its code" not in body
+    assert "This is not a problem in the app's code." in body
+    assert outcome.status_payload()["description"] == "Refused: Pippa's own sentence."
+
+
+@pytest.mark.parametrize("reason", sorted(hp.IDENTITY_REFUSALS))
+def test_an_identity_refusal_without_a_sentence_uses_the_built_in_one(app, reason):
+    reply = {"statusCode": 409, "ok": False, "error_class": "code", "error_kind": "refused", "error": "",
+             "error_reason": reason}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    outcome = run.execute(hp.CheckState())
+    assert outcome.kind == "refused"
+    assert outcome.detail == hp.IDENTITY_REFUSALS[reason].sentence
+    assert "without giving a reason" not in outcome.comment_payload()["body"]
+
+
+def test_the_actor_refusal_is_recognised_by_its_sentence_alone(app):
+    reply = {"statusCode": 403, "ok": False, "error_class": "code", "error": ACTOR_SENTENCE}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    outcome = run.execute(hp.CheckState())
+    assert outcome.kind == "refused" and outcome.reason == "actor_not_builder"
+    body = outcome.comment_payload()["body"]
+    assert f"```text\n{ACTOR_SENTENCE}\n```" in body
+    assert "Push from the GitHub account Pippa Labs invited to this repository." in body
+
+
+def test_the_publishers_own_event_refusal_is_recognised_by_its_sentence(app):
+    reply = {"statusCode": 403, "ok": False, "error_class": "code",
+             "error": "Only a push to main publishes; this run was workflow_dispatch"}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    outcome = run.execute(hp.CheckState())
+    assert outcome.kind == "refused" and outcome.reason == "not_a_push"
+    assert "Push a commit to main to publish." in outcome.comment_payload()["body"]
+
+
+@pytest.mark.parametrize("reply", [
+    {"statusCode": 500, "ok": False, "error_class": "infra", "error": ACTOR_SENTENCE, "reason": "actor_not_builder",
+     "reference": "pub-1"},
+    {"statusCode": 403, "ok": False, "error": ACTOR_SENTENCE, "reason": "token_replayed"},
+])
+def test_an_identity_reason_never_turns_an_infra_or_unclassified_reply_into_a_refusal(app, reply):
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    assert run.execute(hp.CheckState()).kind == "infra"
+
+
+@pytest.mark.parametrize("reason", ["something_else", "", None, 5, ["actor_not_builder"]])
+def test_unknown_reasons_keep_the_old_classification(app, reason):
+    reply = {"statusCode": 400, "ok": False, "error_class": "code", "error": "bad id", "reason": reason}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    assert run.execute(hp.CheckState()).kind == "code"
+
+
+def test_a_repository_refusal_keeps_the_generic_next_step(app):
+    run, _ = make_run(app, FakeClient(json.dumps(refusal_reply()).encode()))
+    outcome = run.execute(hp.CheckState())
+    assert outcome.reason == ""
+    assert hp.REFUSED_NEXT_STEP in outcome.comment_payload()["body"]
+    assert "(Reason:" not in outcome.comment_payload()["body"]
+
+
+# ---- an app published without all of its API keys ----
+
+KEYS_WARNING = "Published, but it can't run until you add OPENWEATHER_API_KEY in Created by me."
+
+
+def test_missing_api_keys_lead_the_message_apart_from_the_warnings(app, capsys):
+    reply = {**SUCCESS, "warnings": [KEYS_WARNING, LEGACY_PUBLISHER]}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    run.factory = hp.OutcomeFactory(RUN_URL, REF, WARNINGS)
+    outcome = run.execute(hp.CheckState())
+    assert outcome.kind == "success" and outcome.state == "success"
+    assert outcome.keys_missing == [KEYS_WARNING]
+    body = outcome.comment_payload()["body"]
+    assert body.startswith(
+        "Your app Days Until (hack.x v0.1.0) is published, but it can't run until you add its API keys. "
+        "Open https://app.getpippa.ai, go to Created by me, open the app and add them under Keys. "
+        "No push is needed: the keys stay in Pippa, never in GitHub.\n\n"
+        f"```text\n WARN {KEYS_WARNING}\n```"
+    )
+    warnings = body.split("Warnings (they did not stop the publish; fix them and push again):", 1)[1]
+    assert KEYS_WARNING not in warnings
+    assert f"Pippa\n WARN {LEGACY_PUBLISHER}\n\nscripts/check.py" in warnings
+    assert "is live" not in body
+    assert outcome.status_payload()["description"] == "Live: hack.x v0.1.0; add its API keys in Pippa"
+    assert f"Warning  {KEYS_WARNING}" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("sentence", [
+    "Published, but it cannot run until you add A_KEY and B_KEY in Created by me.",
+    "Published, but it can" + chr(0x2019) + "t run until you add A_KEY in Created by me.",
+    "It CAN'T RUN UNTIL YOU ADD WEATHER_KEY.",
+])
+def test_missing_key_warnings_in_other_words(sentence):
+    published = hp.Published(RUN_URL, {**SUCCESS, "warnings": [sentence]})
+    assert published.keys_missing == [published.runtime_warnings[0]]
+    assert published.all_warnings == ""
+
+
+def test_only_missing_keys_make_no_warnings_section(app):
+    reply = {**SUCCESS, "warnings": [KEYS_WARNING]}
+    run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
+    body = run.execute(hp.CheckState()).comment_payload()["body"]
+    assert "Warnings (they did not stop" not in body
+    assert body.count(KEYS_WARNING) == 1
+
+
+def test_other_warnings_keep_the_live_message():
+    published = hp.Published(RUN_URL, {**SUCCESS, "warnings": ["Your app runs slowly until you add a cache."]})
+    assert published.keys_missing == []
+    assert published.message.startswith("Your app Days Until (hack.x v0.1.0) is live.")
+    assert published.description == "Live: hack.x v0.1.0"

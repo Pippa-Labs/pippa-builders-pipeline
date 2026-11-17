@@ -5,8 +5,12 @@ Packages the app, requests a GitHub OIDC token for the publisher, invokes the
 publisher Lambda and classifies the result as success, code error, refusal or
 platform error. A refusal is the publisher saying no for a reason that is not
 in the app's code (`error_kind: "refused"`): the repository is not linked to a
-Pippa account, or manifest.yaml has something Pippa does not accept. Writes the
-report files the action posts:
+Pippa account, or manifest.yaml has something Pippa does not accept, or the run
+itself may not publish (a `reason` of IDENTITY_REFUSALS: pushed by somebody who
+is not the repository's builder, a token used twice, not a push). Every invoke
+carries a token requested for that attempt: the publisher accepts a token once.
+A published app whose API keys are not all added yet says so first, apart from
+the warnings that a push fixes. Writes the report files the action posts:
 
     outcome       success, code, refused or infra
     status.json   body for POST /repos/{owner}/{repo}/statuses/{sha}
@@ -29,6 +33,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -69,6 +74,49 @@ PLATFORM_MARKER = "PLATFORM_ERROR"
 #: It comes with `error_class: "code"`, so an older pipeline still shows the sentence.
 REFUSED_KIND = "refused"
 REFUSED_WITHOUT_REASON = "Pippa refused to publish this app without giving a reason. Ask an organiser."
+REFUSED_NEXT_STEP = (
+    "This is not a problem in the app's code: do what the message says, then push again. If it says to "
+    "ask an organiser, changing the code will not help."
+)
+
+
+@dataclass(frozen=True)
+class IdentityRefusal:
+    """What Pippa says when the run itself may not publish, and what the builder does about it."""
+
+    sentence: str
+    next_step: str
+
+
+#: The `reason` of a refusal about who or what started the run rather than the app (the runtime's
+#: pre-check, relayed by the publisher). The sentence stands in when Pippa sends none.
+IDENTITY_REFUSALS = {
+    "actor_not_builder": IdentityRefusal(
+        "Only the builder this repository belongs to can publish it.",
+        "Push from the GitHub account Pippa Labs invited to this repository. If somebody else pushed to "
+        "it, tell an organiser. Changing the code will not help.",
+    ),
+    "token_replayed": IdentityRefusal(
+        "This run's one-time permission to publish had already been used.",
+        "Push again to publish. If it happens again, tell an organiser and give them the run log link.",
+    ),
+    "not_a_push": IdentityRefusal(
+        "Only a push to main publishes; this run was started another way.",
+        "Push a commit to main to publish.",
+    ),
+    "builder_identity_unknown": IdentityRefusal(
+        "Pippa does not know yet which GitHub account this repository belongs to, so it cannot check who pushed.",
+        "Ask an organiser to finish setting up this repository. Changing the code will not help.",
+    ),
+}
+#: Sentences that name an identity refusal, for a publisher that relays the sentence without the `reason`.
+IDENTITY_SENTENCES = (
+    ("Only the builder this repository belongs to can publish it", "actor_not_builder"),
+    ("Only a push to main publishes", "not_a_push"),
+)
+#: A runtime warning about an API key the app declares but its builder has not added yet, e.g.
+#: "Published, but it can't run until you add OPENWEATHER_API_KEY in Created by me."
+KEYS_MISSING = re.compile(r"\b(?:can[\u2019']?t|cannot|can not)\s+run\s+until\s+you\s+add\b", re.IGNORECASE)
 
 MAX_BUNDLE_BYTES = 3 * 1024 * 1024
 SKIP_DIRS = frozenset({
@@ -136,6 +184,16 @@ def runtime_warnings(reply: dict[str, Any]) -> list[str]:
     return [truncate(item, RUNTIME_WARNING_LIMIT) for item in sentences if item][:RUNTIME_WARNINGS_COUNT]
 
 
+def identity_reason(reply: dict[str, Any]) -> str:
+    """The IDENTITY_REFUSALS code of a refusal: its `reason` (or `error_reason`), else its sentence; or ""."""
+    for name in ("reason", "error_reason"):
+        value = reply.get(name)
+        if isinstance(value, str) and value.strip() in IDENTITY_REFUSALS:
+            return value.strip()
+    sentence = str(reply.get("error") or "").strip()
+    return next((reason for start, reason in IDENTITY_SENTENCES if sentence.startswith(start)), "")
+
+
 class Outcome(ABC):
     """Result of a publish run, rendered as commit status, commit comment and summary."""
 
@@ -179,6 +237,8 @@ class Published(Outcome):
         super().__init__(run_url)
         self.warnings = truncate(warnings, WARNINGS_LIMIT)
         self.runtime_warnings = runtime_warnings(reply)
+        #: Pippa's warnings that the app cannot run until its builder adds an API key; no push fixes them.
+        self.keys_missing = [sentence for sentence in self.runtime_warnings if KEYS_MISSING.search(sentence)]
         self.app_id = str(reply["app_id"])
         self.version = str(reply["version"])
         self.name = str(reply["name"])
@@ -187,14 +247,20 @@ class Published(Outcome):
 
     @property
     def description(self) -> str:
+        if self.keys_missing:
+            return f"Live: {self.app_id} v{self.version}; add its API keys in Pippa"
         return f"Live: {self.app_id} v{self.version}"
 
     @property
     def all_warnings(self) -> str:
-        """Pippa's own warnings first, as WARN lines under one title, then those of the build."""
+        """Pippa's own warnings first, as WARN lines under one title, then those of the build.
+
+        The missing API keys are not among them: the message lists those on their own.
+        """
         sections = []
-        if self.runtime_warnings:
-            lines = [f" WARN {sentence}" for sentence in self.runtime_warnings]
+        others = [sentence for sentence in self.runtime_warnings if sentence not in self.keys_missing]
+        if others:
+            lines = [f" WARN {sentence}" for sentence in others]
             sections.append("\n".join([RUNTIME_WARNINGS_TITLE, *lines]))
         if self.warnings:
             sections.append(self.warnings)
@@ -202,10 +268,19 @@ class Published(Outcome):
 
     @property
     def message(self) -> str:
-        message = (
-            f"Your app {self.name} ({self.app_id} v{self.version}) is live. "
-            f"Open {APP_URL}, go to Apps, install it and try it."
-        )
+        if self.keys_missing:
+            keys = "\n".join(f" WARN {sentence}" for sentence in self.keys_missing)
+            message = (
+                f"Your app {self.name} ({self.app_id} v{self.version}) is published, but it can't run "
+                f"until you add its API keys. Open {APP_URL}, go to Created by me, open the app and add "
+                "them under Keys. No push is needed: the keys stay in Pippa, never in GitHub.\n\n"
+                f"{fence(keys)}"
+            )
+        else:
+            message = (
+                f"Your app {self.name} ({self.app_id} v{self.version}) is live. "
+                f"Open {APP_URL}, go to Apps, install it and try it."
+            )
         if self.all_warnings:
             message += (
                 "\n\nWarnings (they did not stop the publish; fix them and push again):\n\n"
@@ -251,9 +326,12 @@ class Refusal(Outcome):
     kind = "refused"
     state = "failure"
 
-    def __init__(self, run_url: str, detail: str) -> None:
+    def __init__(self, run_url: str, detail: str, reason: str = "") -> None:
         super().__init__(run_url)
-        self.detail = truncate(detail, DETAILS_LIMIT) or REFUSED_WITHOUT_REASON
+        #: A code of IDENTITY_REFUSALS, or "" for a refusal about the repository or the manifest.
+        self.reason = reason if reason in IDENTITY_REFUSALS else ""
+        fallback = IDENTITY_REFUSALS[self.reason].sentence if self.reason else REFUSED_WITHOUT_REASON
+        self.detail = truncate(detail, DETAILS_LIMIT) or fallback
 
     @property
     def description(self) -> str:
@@ -261,12 +339,17 @@ class Refusal(Outcome):
 
     @property
     def message(self) -> str:
+        if self.reason:
+            next_step = (
+                f"{IDENTITY_REFUSALS[self.reason].next_step} This is not a problem in the app's code. "
+                f"(Reason: {self.reason})"
+            )
+        else:
+            next_step = REFUSED_NEXT_STEP
         return (
             f"{REFUSED_MARKER}: the app was not published:\n\n"
             f"{fence(self.detail)}\n\n"
-            "Nothing was published, and every version published before is unchanged. This is not "
-            "a problem in the app's code: do what the message "
-            "says, then push again. If it says to ask an organiser, changing the code will not help.\n\n"
+            f"Nothing was published, and every version published before is unchanged. {next_step}\n\n"
             f"Run log: {self.run_url}"
         )
 
@@ -303,8 +386,8 @@ class OutcomeFactory:
     def code(self, error: str) -> CodeFailure:
         return CodeFailure(self.run_url, error)
 
-    def refused(self, detail: str) -> Refusal:
-        return Refusal(self.run_url, detail)
+    def refused(self, detail: str, reason: str = "") -> Refusal:
+        return Refusal(self.run_url, detail, reason)
 
     def platform(self, reference: str | None = None) -> PlatformFailure:
         return PlatformFailure(self.run_url, reference or self.reference)
@@ -334,10 +417,13 @@ class OutcomeFactory:
             )
             return published
         error_class = reply.get("error_class")
-        if error_class == REFUSED_KIND or (error_class == "code" and reply.get("error_kind") == REFUSED_KIND):
-            detail = str(reply.get("error") or "")
-            print(f"\n{'=' * 68}\n{REFUSED_MARKER}: the app was not published:\n\n  {detail}\n{'=' * 68}")
-            return self.refused(detail)
+        reason = identity_reason(reply) if error_class in ("code", REFUSED_KIND) else ""
+        if reason or error_class == REFUSED_KIND or (
+            error_class == "code" and reply.get("error_kind") == REFUSED_KIND
+        ):
+            refusal = self.refused(str(reply.get("error") or ""), reason)
+            print(f"\n{'=' * 68}\n{REFUSED_MARKER}: the app was not published:\n\n  {refusal.detail}\n{'=' * 68}")
+            return refusal
         if error_class == "code":
             error = str(reply.get("error") or "")
             print(f"\n{'=' * 68}\nPippa refused to publish this app:\n\n  {error}\n{'=' * 68}")
@@ -460,16 +546,24 @@ class ActionsTokenProvider(TokenProvider):
         return value
 
 
+EventFactory = Callable[[], dict[str, Any]]
+
+
 class Publisher(ABC):
     @abstractmethod
-    def publish(self, event: dict[str, Any]) -> Any:
-        """Sends the event and returns the decoded reply."""
+    def publish(self, make_event: EventFactory) -> Any:
+        """Sends an event built by make_event and returns the decoded reply.
+
+        make_event is called again for every attempt, so each attempt carries its own OIDC
+        token: the publisher accepts a token once and refuses a reused one as a replay.
+        """
 
 
 class LambdaPublisher(Publisher):
     """Invokes the publisher function synchronously.
 
-    Only a throttled invoke is retried: Lambda refuses it before the function runs.
+    Only a throttled invoke is retried: Lambda refuses it before the function runs. The
+    retry is still a new event with a new token.
     """
 
     def __init__(
@@ -497,10 +591,8 @@ class LambdaPublisher(Publisher):
             ),
         )
 
-    def publish(self, event: dict[str, Any]) -> Any:
-        payload = json.dumps(event).encode()
-        print(f"Publishing to {self.function} ({len(payload) // 1024} KB)")
-        response = self._invoke(payload)
+    def publish(self, make_event: EventFactory) -> Any:
+        response = self._invoke(make_event)
         request_id = (response.get("ResponseMetadata") or {}).get("RequestId")
         try:
             raw = response["Payload"].read()
@@ -520,8 +612,10 @@ class LambdaPublisher(Publisher):
                 reference=request_id,
             ) from exc
 
-    def _invoke(self, payload: bytes) -> dict[str, Any]:
+    def _invoke(self, make_event: EventFactory) -> dict[str, Any]:
         for attempt in range(1, THROTTLE_ATTEMPTS + 1):
+            payload = json.dumps(make_event()).encode()
+            print(f"Publishing to {self.function} ({len(payload) // 1024} KB, attempt {attempt})")
             try:
                 return self.client.invoke(
                     FunctionName=self.function,
@@ -587,12 +681,13 @@ class PublishRun:
     def _publish(self) -> Outcome:
         package = Packager(self.app_dir).build()
         manifest = load_manifest(self.app_dir)
-        event = {
-            "token": self.token_provider.token(TOKEN_AUDIENCE),
-            "manifest": manifest,
-            "code_zip_b64": base64.b64encode(package.data).decode(),
-        }
-        reply = self.publisher_factory().publish(event)
+        code = base64.b64encode(package.data).decode()
+
+        def make_event() -> dict[str, Any]:
+            # A new token for every attempt: the publisher refuses a token it has seen.
+            return {"token": self.token_provider.token(TOKEN_AUDIENCE), "manifest": manifest, "code_zip_b64": code}
+
+        reply = self.publisher_factory().publish(make_event)
         return self.factory.from_reply(reply)
 
 
