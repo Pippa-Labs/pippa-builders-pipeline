@@ -389,7 +389,7 @@ def test_fetch_sdk_without_a_wheel_fails(tmp_path, bin_dir):
 # ---- install-sdk (the check job) ----
 
 PIN = f"pippa-agentapp-sdk==0.1.3 --hash=sha256:{SHA}\n"
-KEY = "0123456789abcdef" * 4
+KEY = "ab" * 32  # what a run's hand-over key looks like (64 hex characters); not a secret
 INSTALL_DIR = "hack-sdk-install"
 
 
