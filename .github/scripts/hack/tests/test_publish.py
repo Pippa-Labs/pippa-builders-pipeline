@@ -1134,8 +1134,9 @@ def test_other_warnings_keep_the_usual_message():
 # ---- the success message: how to reach this version in Pippa ----
 #
 # GitHub emails the comment to whoever pushed. What it says depends on the reply's `change` (the
-# app's first version, a new version number, or a draft pushed again), `review_status` (approved:
-# public at once, because review is switched off) and `live_version` (what everybody else gets).
+# app's first version, a new version number, or a draft pushed again), `live_version` (what everybody
+# else gets) and whether this version is public at once: `review_status` approved, or `live_version`
+# naming this very version, which is how the runtime answers with review switched off.
 
 GUIDE_URL = "https://github.com/Pippa-Labs/pippa-hack-x/blob/HEAD/docs/REVIEW_AND_SHARING.md"
 GUIDE_LINE = f"More about versions, testers and review: [REVIEW_AND_SHARING.md in your repository]({GUIDE_URL})"
@@ -1175,8 +1176,8 @@ NEW_VERSION_MESSAGE = (
     "#### Try the new version\n\n"
     "You stay on the version you installed until you switch:\n\n"
     "1. Open [app.getpippa.ai/apps](https://app.getpippa.ai/apps) and choose **Created by me**.\n"
-    "2. On your app's card, press **Update to latest**. If **Always use my latest version** is on, you "
-    "have 0.2.0 already.\n"
+    "2. On your app's card, press **Update to latest**, or **Install v0.2.0** if your app isn't installed. "
+    "If **Always use my latest version** is on, you have 0.2.0 already.\n"
     "3. Ask Pippa something your app does, for example `how long until Friday?`. The reply should carry "
     "the badge **via Days Until 0.2.0**.\n\n"
     "Your testers get 0.2.0 too, unless you chose a particular version for them under **Testers get**.\n\n"
@@ -1250,15 +1251,26 @@ def test_the_live_version_is_text_from_the_reply_and_is_escaped():
     assert "<b>" not in message and "@octo" not in message
 
 
+#: The two replies that make version 0.1.0 public at once. The runtime stores every push as a draft,
+#: so with review switched off it answers `review_status: draft` and names the version just pushed
+#: as `live_version`; `approved` is kept for a runtime that says so.
+PUBLIC_REPLIES = [
+    pytest.param({"review_status": "approved", "live_version": "0.1.0"}, id="approved"),
+    pytest.param({"review_status": "draft", "live_version": "0.1.0"}, id="review-off"),
+]
+
+
 @pytest.mark.parametrize("change, headline", [
     ("first", "**Days Until 0.1.0 is published, and it's live:** anyone in Pippa can install it."),
     ("new_version", "**Days Until 0.1.0 is published, and it's live:** anyone in Pippa can install it."),
     ("", "**Days Until 0.1.0 is published, and it's live:** anyone in Pippa can install it."),
 ])
-def test_a_version_public_at_once_says_it_is_live_and_skips_review(change, headline):
-    """review_status approved: review is switched off on the runtime, so nothing waits for approval."""
-    outcome = published(change=change, review_status="approved", live_version="0.1.0")
+@pytest.mark.parametrize("reply", PUBLIC_REPLIES)
+def test_a_version_public_at_once_says_it_is_live_and_skips_review(change, headline, reply):
+    """Review is switched off on the runtime, so nothing waits for approval."""
+    outcome = published(change=change, **reply)
     message = outcome.message
+    assert outcome.public
     assert message.split("\n\n", 1)[0] == headline
     assert "#### When it's ready" not in message and "Submit for review" not in message
     assert "private draft" not in message and "Testers get" not in message
@@ -1266,21 +1278,85 @@ def test_a_version_public_at_once_says_it_is_live_and_skips_review(change, headl
     assert outcome.description == "Live: hack.x v0.1.0"
 
 
-def test_a_public_first_version_still_says_how_to_install_it():
-    message = published(change="first", review_status="approved", live_version="0.1.0").message
+@pytest.mark.parametrize("reply", PUBLIC_REPLIES)
+def test_a_public_first_version_still_says_how_to_install_it(reply):
+    message = published(change="first", **reply).message
     assert message == FIRST_MESSAGE.replace(
         FIRST_MESSAGE.split("\n\n", 1)[0],
         "**Days Until 0.1.0 is published, and it's live:** anyone in Pippa can install it.",
     ).replace(FIRST_MESSAGE[FIRST_MESSAGE.index("#### When it's ready"):FIRST_MESSAGE.index("Can't see")], "")
 
 
-@pytest.mark.parametrize("status", [None, "draft", "pending", "rejected", "suspended", "APPROVED", "live", 1, True])
-def test_only_approved_is_public(status):
-    reply = {"change": "first"} if status is None else {"change": "first", "review_status": status}
-    outcome = published(**reply)
+PUBLIC_NEW_VERSION_MESSAGE = (
+    "**Days Until 0.2.0 is published, and it's live:** anyone in Pippa can install it.\n\n"
+    "#### Try the new version\n\n"
+    "You stay on the version you installed until you switch:\n\n"
+    "1. Open [app.getpippa.ai/apps](https://app.getpippa.ai/apps) and choose **Created by me**.\n"
+    "2. On your app's card, press **Update to latest**, or **Install v0.2.0** if your app isn't installed. "
+    "If **Always use my latest version** is on, you have 0.2.0 already.\n"
+    "3. Ask Pippa something your app does, for example `how long until Friday?`. The reply should carry "
+    "the badge **via Days Until 0.2.0**.\n\n"
+    "If **Always use my latest version** is on and you changed the app's name, summary or example "
+    "phrases, press **Uninstall** on the card, then **Install v0.2.0**: Pippa picks up that wording when "
+    "the app is installed.\n\n"
+    f"{GUIDE_LINE}"
+)
+
+
+def test_with_review_switched_off_a_new_version_is_live_for_everyone():
+    """The runtime's own reply with PIPPA_APPRUNTIME_ENFORCE_REVIEW off: the push is stored as a draft,
+    and the version just pushed is what everybody gets. It used to read "private draft", "Everyone else
+    keeps using 0.2.0 ... until 0.2.0 is approved" and "Submit for review"."""
+    outcome = published(change="new_version", version="0.2.0", review_status="draft", live_version="0.2.0")
+    assert outcome.public
+    assert outcome.message == PUBLIC_NEW_VERSION_MESSAGE
+    assert outcome.description == "Live: hack.x v0.2.0"
+
+
+def test_with_review_switched_off_a_draft_pushed_again_is_live_and_skips_review():
+    outcome = published(change="same_version", version="0.2.0", review_status="draft", live_version=" 0.2.0 ")
+    assert outcome.public
+    ready = SAME_VERSION_MESSAGE.index("#### When it's ready")
+    assert outcome.message == SAME_VERSION_MESSAGE[:ready] + GUIDE_LINE
+    assert outcome.description == "Live: hack.x v0.2.0"
+
+
+@pytest.mark.parametrize("reply", [
+    {},
+    *({"review_status": status} for status in
+      ["draft", "pending", "rejected", "suspended", "APPROVED", "live", 1, True]),
+    # Another version is the live one: with review on, a version just pushed never is.
+    {"review_status": "draft", "live_version": "0.0.9"},
+    {"review_status": "draft", "live_version": "0.1.0.1"},
+    {"review_status": "draft", "live_version": "v0.1.0"},
+    {"review_status": "draft", "live_version": None},
+    {"review_status": "draft", "live_version": ["0.1.0"]},
+    {"review_status": "draft", "live_version": {"version": "0.1.0"}},
+    # No version to match: an empty live version is no live version.
+    {"review_status": "draft", "version": "", "live_version": ""},
+    {"review_status": "draft", "version": "", "live_version": "  "},
+])
+def test_a_version_is_public_only_when_approved_or_live_itself(reply):
+    outcome = published(change="first", **reply)
     assert not outcome.public
-    assert outcome.description == DRAFT_STATUS
+    assert outcome.description.startswith("Published as a private draft: hack.x v")
     assert "it's live" not in outcome.message
+
+
+@pytest.mark.parametrize("change", [*hp.CHANGES, ""])
+@pytest.mark.parametrize("reply", [
+    {"review_status": "draft", "live_version": "0.1.0"},
+    {"review_status": "draft", "live_version": None},
+    {"review_status": "draft", "live_version": "0.2.0"},
+    {"review_status": "approved", "live_version": "0.2.0"},
+])
+def test_every_step_naming_update_to_latest_also_names_install(change, reply):
+    """**Update to latest** is on the card only when the app is installed. Without an install the card
+    shows **Install v<version>** instead (cardActions in the web app's lib/appVersions.js)."""
+    message = published(change=change, version="0.2.0", **reply).message
+    lines = [line for line in message.splitlines() if "**Update to latest**" in line]
+    assert lines or change in (hp.CHANGE_FIRST, hp.CHANGE_SAME_VERSION)
+    assert all("**Install v0.2.0**" in line for line in lines)
 
 
 @pytest.mark.parametrize("reply", [
@@ -1300,25 +1376,28 @@ def test_a_missing_or_unknown_change_gets_the_message_for_either_case(reply):
 
 
 @pytest.mark.parametrize("change", [*hp.CHANGES, ""])
-@pytest.mark.parametrize("status", ["draft", "approved"])
-def test_missing_api_keys_come_first_in_every_case(change, status):
-    outcome = published(change=change, review_status=status, live_version="0.1.0", check_warnings=WARNINGS,
-                        warnings=[KEYS_WARNING, LEGACY_PUBLISHER])
+@pytest.mark.parametrize("reply", [
+    pytest.param({"review_status": "draft", "version": "0.2.0", "live_version": "0.1.0"}, id="draft"),
+    *PUBLIC_REPLIES,
+])
+def test_missing_api_keys_come_first_in_every_case(change, reply):
+    outcome = published(change=change, check_warnings=WARNINGS, warnings=[KEYS_WARNING, LEGACY_PUBLISHER],
+                        **reply)
     message = outcome.message
     headline, rest = message.split("\n\n", 1)
     assert rest.startswith(f"{KEYS_SECTION}\n\n#### Try")
     assert message.count(KEYS_WARNING) == 1
     assert message.endswith(f"{WARNINGS_TITLE}{hp.fence(outcome.all_warnings)}")
     assert outcome.description.endswith("; add its API keys in Pippa")
-    without_keys = published(change=change, review_status=status, live_version="0.1.0")
+    without_keys = published(change=change, **reply)
     assert headline == without_keys.message.split("\n\n", 1)[0]
     assert "First, add its API keys" not in without_keys.message
 
 
 @pytest.mark.parametrize("change", [*hp.CHANGES, ""])
 def test_the_warnings_section_is_last_in_every_case(change):
-    outcome = published(change=change, review_status="draft", live_version="0.1.0", check_warnings=WARNINGS,
-                        warnings=[LEGACY_PUBLISHER])
+    outcome = published(change=change, review_status="draft", version="0.2.0", live_version="0.1.0",
+                        check_warnings=WARNINGS, warnings=[LEGACY_PUBLISHER])
     message = outcome.message
     assert message.count("#### Warnings") == 1
     section = message.split(f"\n\n{WARNINGS_TITLE}", 1)[1]
@@ -1327,13 +1406,17 @@ def test_the_warnings_section_is_last_in_every_case(change):
 
 
 @pytest.mark.parametrize("change", [*hp.CHANGES, ""])
-@pytest.mark.parametrize("status", ["draft", "approved"])
+@pytest.mark.parametrize("status, live, state", [
+    ("draft", None, "Published as a private draft"),
+    ("draft", "10.20.299", "Published as a private draft"),
+    ("approved", None, "Live"),
+    ("draft", "10.20.300", "Live"),  # review switched off: the version just pushed is the live one
+])
 @pytest.mark.parametrize("keys", [[], [KEYS_WARNING]])
-def test_the_status_says_draft_or_live_and_fits_in_140_characters(change, status, keys):
+def test_the_status_says_draft_or_live_and_fits_in_140_characters(change, status, live, state, keys):
     long_id = "hack.a_rather_long_app_id_for_a_rather_long_app_name_x"
     outcome = hp.Published(RUN_URL, {**SUCCESS, "app_id": long_id, "version": "10.20.300", "change": change,
-                                     "review_status": status, "warnings": keys})
-    state = "Live" if status == "approved" else "Published as a private draft"
+                                     "review_status": status, "live_version": live, "warnings": keys})
     expected = f"{state}: {long_id} v10.20.300" + ("; add its API keys in Pippa" if keys else "")
     assert outcome.description == expected
     assert len(expected) <= hp.STATUS_DESCRIPTION_LIMIT
@@ -1342,7 +1425,7 @@ def test_the_status_says_draft_or_live_and_fits_in_140_characters(change, status
 
 def test_the_footer_tells_a_first_publisher_to_reload_and_everyone_where_the_guide_is():
     for change, reload in (("first", True), ("", True), ("new_version", False), ("same_version", False)):
-        message = published(change=change, review_status="draft", live_version="0.1.0").message
+        message = published(change=change, review_status="draft", version="0.2.0", live_version="0.1.0").message
         assert ("Can't see your app? Reload the Apps page" in message) is reload
         assert message.endswith(GUIDE_LINE)
     assert "REVIEW_AND_SHARING" not in published(change="first", guide_url="").message
@@ -1548,11 +1631,15 @@ def test_from_reply_without_a_manifest_has_no_example_phrase():
     assert "4. Ask Pippa something your app does.\n" in outcome.message
 
 
-@pytest.mark.parametrize("status, banner", [("approved", "YOUR APP IS LIVE IN PIPPA"),
-                                            ("draft", "YOUR APP IS PUBLISHED IN PIPPA"),
-                                            (None, "YOUR APP IS PUBLISHED IN PIPPA")])
-def test_the_log_banner_says_live_only_for_a_public_version(status, banner, capsys):
-    hp.OutcomeFactory(RUN_URL, REF).from_reply({**SUCCESS, "review_status": status})
+@pytest.mark.parametrize("reply, banner", [
+    ({"review_status": "approved"}, "YOUR APP IS LIVE IN PIPPA"),
+    ({"review_status": "draft", "live_version": "0.1.0"}, "YOUR APP IS LIVE IN PIPPA"),  # review switched off
+    ({"review_status": "draft", "live_version": "0.0.9"}, "YOUR APP IS PUBLISHED IN PIPPA"),
+    ({"review_status": "draft"}, "YOUR APP IS PUBLISHED IN PIPPA"),
+    ({"review_status": None}, "YOUR APP IS PUBLISHED IN PIPPA"),
+])
+def test_the_log_banner_says_live_only_for_a_public_version(reply, banner, capsys):
+    hp.OutcomeFactory(RUN_URL, REF).from_reply({**SUCCESS, **reply})
     out = capsys.readouterr().out
     assert banner in out
     assert "  App      Days Until  (hack.x v0.1.0)\n  Can do   days.until\n" in out

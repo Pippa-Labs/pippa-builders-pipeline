@@ -82,7 +82,7 @@ CHANGE_FIRST = "first"  # the app's first version
 CHANGE_NEW_VERSION = "new_version"  # a version number this app had not published before
 CHANGE_SAME_VERSION = "same_version"  # a draft pushed again under its own number: replaced in place
 CHANGES = (CHANGE_FIRST, CHANGE_NEW_VERSION, CHANGE_SAME_VERSION)
-#: The reply's `review_status` of a version everybody gets at once (review switched off).
+#: The reply's `review_status` of a version everybody can install.
 APPROVED = "approved"
 #: The guide in every app repository that explains versions, testers and review.
 REVIEW_GUIDE = "docs/REVIEW_AND_SHARING.md"
@@ -425,7 +425,7 @@ class Published(Outcome):
     GitHub emails the comment to whoever pushed, so it is written as that email: what happened,
     how to try this version in Pippa, and what to do when it is ready. Which steps apply depends
     on `change` (the app's first version, a new version number, or a draft pushed again) and on
-    whether the version is public at once (`review_status` approved: review switched off).
+    whether everybody gets the version at once (`public`: review switched off).
     """
 
     kind = "success"
@@ -453,9 +453,15 @@ class Published(Outcome):
         #: One of CHANGES, or "" from a publisher or runtime that does not say.
         self.change = change if change in CHANGES else ""
         live = reply.get("live_version")
-        #: The approved version everybody else gets, or "" when the app is not public.
+        #: The version everybody else gets after this publish, or "" when nobody gets one.
         self.live_version = live.strip() if isinstance(live, str) else ""
-        self.public = reply.get("review_status") == APPROVED
+        #: Everybody gets this version now: it is approved, or it is the live version itself. The
+        #: runtime stores every push as a draft, so with review switched off its reply says
+        #: `review_status: draft` and names this version as `live_version`. With review on, a
+        #: version just pushed is a draft and never the live one.
+        self.public = reply.get("review_status") == APPROVED or (
+            bool(self.live_version) and self.live_version == self.version
+        )
         self.phrase = example_phrase(manifest)
         self.guide_url = guide_url
 
@@ -577,8 +583,8 @@ class Published(Outcome):
                 "#### Try the new version\n\n"
                 "You stay on the version you installed until you switch:\n\n"
                 f"1. Open {APPS_LINK} and choose **Created by me**.\n"
-                "2. On your app's card, press **Update to latest**. If **Always use my latest version** "
-                f"is on, you have {v} already.\n"
+                f"2. On your app's card, press **Update to latest**, or **Install v{v}** if your app isn't "
+                f"installed. If **Always use my latest version** is on, you have {v} already.\n"
                 f"3. {self._ask} The reply should carry the badge {self._badge}.\n\n"
                 + ("" if self.public else
                    f"Your testers get {v} too, unless you chose a particular version for them under "
