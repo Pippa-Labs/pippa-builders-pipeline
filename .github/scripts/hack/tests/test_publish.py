@@ -1304,9 +1304,9 @@ PUBLIC_NEW_VERSION_MESSAGE = (
 
 
 def test_with_review_switched_off_a_new_version_is_live_for_everyone():
-    """The runtime's own reply with PIPPA_APPRUNTIME_ENFORCE_REVIEW off: the push is stored as a draft,
-    and the version just pushed is what everybody gets. It used to read "private draft", "Everyone else
-    keeps using 0.2.0 ... until 0.2.0 is approved" and "Submit for review"."""
+    """The runtime's own reply with review switched off: the push is stored as a draft, and the version
+    just pushed is what everybody gets. It used to read "private draft", "Everyone else keeps using
+    0.2.0 ... until 0.2.0 is approved" and "Submit for review"."""
     outcome = published(change="new_version", version="0.2.0", review_status="draft", live_version="0.2.0")
     assert outcome.public
     assert outcome.message == PUBLIC_NEW_VERSION_MESSAGE
@@ -1351,8 +1351,8 @@ def test_a_version_is_public_only_when_approved_or_live_itself(reply):
     {"review_status": "approved", "live_version": "0.2.0"},
 ])
 def test_every_step_naming_update_to_latest_also_names_install(change, reply):
-    """**Update to latest** is on the card only when the app is installed. Without an install the card
-    shows **Install v<version>** instead (cardActions in the web app's lib/appVersions.js)."""
+    """**Update to latest** is on the app's card only when the app is installed. Without an install the
+    card shows **Install v<version>** instead."""
     message = published(change=change, version="0.2.0", **reply).message
     lines = [line for line in message.splitlines() if "**Update to latest**" in line]
     assert lines or change in (hp.CHANGE_FIRST, hp.CHANGE_SAME_VERSION)
