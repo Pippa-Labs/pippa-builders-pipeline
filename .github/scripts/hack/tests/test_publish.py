@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -188,18 +189,35 @@ def test_success_event_and_outcome(app):
     assert "app.py" in names and "test_app.py" not in names
 
 
+#: The message when the reply does not say what changed (a publisher or runtime from before
+#: `change`): it works for a first install and for an update.
+EITHER_MESSAGE = (
+    "**Days Until 0.1.0 is published** as a private draft: only you and your testers can get it until "
+    "Pippa Labs approves it.\n\n"
+    "#### Try it in Pippa\n\n"
+    "1. Open [app.getpippa.ai/apps](https://app.getpippa.ai/apps) and choose **Created by me**.\n"
+    "2. Press **Install v0.1.0** if your app isn't installed yet, or **Update to latest** if an older "
+    "version is. With **Always use my latest version** on, you have it already.\n"
+    "3. Ask Pippa something your app does. The reply should carry the badge **via Days Until 0.1.0**.\n\n"
+    "#### When it's ready\n\n"
+    "- **Let someone try it:** press **Share for testing** on the card and add the email address they "
+    "use for Pippa.\n"
+    "- **Make it public:** under **Versions** on the card, press **Submit for review** next to 0.1.0. "
+    "Pippa Labs reviews it, and once it's approved anyone can install it.\n\n"
+    "Can't see your app? Reload the Apps page: it loads the list only once."
+)
+DRAFT_STATUS = "Published as a private draft: hack.x v0.1.0"
+
+
 def test_success_payloads(app):
     run, _ = make_run(app, FakeClient(json.dumps(SUCCESS).encode()))
     outcome = run.execute(hp.CheckState())
     assert outcome.kind == "success"
     assert outcome.status_payload() == {
         "state": "success", "context": "pippa/publish",
-        "description": "Live: hack.x v0.1.0", "target_url": RUN_URL,
+        "description": DRAFT_STATUS, "target_url": RUN_URL,
     }
-    assert outcome.comment_payload() == {"body": (
-        "Your app Days Until (hack.x v0.1.0) is live. Open https://app.getpippa.ai, "
-        "go to Apps, install it and try it."
-    )}
+    assert outcome.comment_payload() == {"body": EITHER_MESSAGE}
     assert "`days.until`" in outcome.summary
 
 
@@ -636,6 +654,8 @@ WARNINGS = (
     "scripts/routing_check.py\n FAIL days.until: \"how long\" is one ordinary word\n"
     "1 problem(s) that will stop your app being chosen."
 )
+#: How the warnings section starts; the warnings follow it in a fence, and nothing follows them.
+WARNINGS_TITLE = "#### Warnings\n\nThese didn't stop the publish. Fix them and push again.\n\n"
 
 
 def test_success_comment_has_no_warnings_section_without_warnings(app):
@@ -648,11 +668,11 @@ def test_success_comment_carries_warnings(app):
     run.factory = hp.OutcomeFactory(RUN_URL, REF, WARNINGS)
     outcome = run.execute(hp.CheckState())
     body = outcome.comment_payload()["body"]
-    assert body.startswith("Your app Days Until (hack.x v0.1.0) is live.")
-    assert "\n\nWarnings (they did not stop the publish; fix them and push again):\n\n```text\n" in body
+    assert body.startswith(f"{EITHER_MESSAGE}\n\n#### Warnings\n\n")
+    assert body.endswith(f"{WARNINGS_TITLE}{hp.fence(WARNINGS)}")
     assert "owner_email is still the template's placeholder" in body
     assert "1 problem(s) that will stop your app being chosen." in body
-    assert outcome.status_payload()["description"] == "Live: hack.x v0.1.0"
+    assert outcome.status_payload()["description"] == DRAFT_STATUS
     assert outcome.state == "success"
 
 
@@ -795,7 +815,7 @@ def test_success_lists_the_runtime_warnings_before_the_build_warnings(app, capsy
     block = body.split("```text\n", 1)[1].split("\n```", 1)[0]
     assert block.startswith(f"Pippa\n WARN {IGNORED_OWNER}\n WARN {LEGACY_PUBLISHER}\n\nscripts/check.py\n")
     assert "1 problem(s) that will stop your app being chosen." in block
-    assert outcome.status_payload()["description"] == "Live: hack.x v0.1.0"
+    assert outcome.status_payload()["description"] == DRAFT_STATUS
     assert f"Warning  {IGNORED_OWNER}" in capsys.readouterr().out
 
 
@@ -803,8 +823,7 @@ def test_runtime_warnings_alone_make_a_warnings_section(app):
     reply = {**SUCCESS, "warnings": [LEGACY_PUBLISHER]}
     run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
     body = run.execute(hp.CheckState()).comment_payload()["body"]
-    assert "Warnings (they did not stop the publish; fix them and push again):" in body
-    assert f"```text\nPippa\n WARN {LEGACY_PUBLISHER}\n```" in body
+    assert body.endswith(f"\n\n{WARNINGS_TITLE}```text\nPippa\n WARN {LEGACY_PUBLISHER}\n```")
 
 
 @pytest.mark.parametrize("warnings", [None, "one sentence", {"a": 1}, [], [1, None, "", "   "]])
@@ -1056,6 +1075,14 @@ def test_a_repository_refusal_keeps_the_generic_next_step(app):
 # ---- an app published without all of its API keys ----
 
 KEYS_WARNING = "Published, but it can't run until you add OPENWEATHER_API_KEY in Created by me."
+#: What the message says first, after the headline, while an API key is missing.
+KEYS_SECTION = (
+    "#### First, add its API keys\n\n"
+    "Days Until can't run until you add them. Open [app.getpippa.ai/apps](https://app.getpippa.ai/apps), "
+    "choose **Created by me**, and press **Add** next to each key under **Keys** on the app's card. No "
+    "push is needed: the keys stay in Pippa, never in GitHub.\n\n"
+    f"```text\n WARN {KEYS_WARNING}\n```"
+)
 
 
 def test_missing_api_keys_lead_the_message_apart_from_the_warnings(app, capsys):
@@ -1066,17 +1093,14 @@ def test_missing_api_keys_lead_the_message_apart_from_the_warnings(app, capsys):
     assert outcome.kind == "success" and outcome.state == "success"
     assert outcome.keys_missing == [KEYS_WARNING]
     body = outcome.comment_payload()["body"]
-    assert body.startswith(
-        "Your app Days Until (hack.x v0.1.0) is published, but it can't run until you add its API keys. "
-        "Open https://app.getpippa.ai, go to Created by me, open the app and add them under Keys. "
-        "No push is needed: the keys stay in Pippa, never in GitHub.\n\n"
-        f"```text\n WARN {KEYS_WARNING}\n```"
-    )
-    warnings = body.split("Warnings (they did not stop the publish; fix them and push again):", 1)[1]
+    headline, rest = body.split("\n\n", 1)
+    assert headline == EITHER_MESSAGE.split("\n\n", 1)[0]
+    assert rest.startswith(f"{KEYS_SECTION}\n\n#### Try it in Pippa\n\n")
+    warnings = body.split(WARNINGS_TITLE, 1)[1]
     assert KEYS_WARNING not in warnings
     assert f"Pippa\n WARN {LEGACY_PUBLISHER}\n\nscripts/check.py" in warnings
-    assert "is live" not in body
-    assert outcome.status_payload()["description"] == "Live: hack.x v0.1.0; add its API keys in Pippa"
+    assert "it's live" not in body
+    assert outcome.status_payload()["description"] == f"{DRAFT_STATUS}; add its API keys in Pippa"
     assert f"Warning  {KEYS_WARNING}" in capsys.readouterr().out
 
 
@@ -1095,12 +1119,473 @@ def test_only_missing_keys_make_no_warnings_section(app):
     reply = {**SUCCESS, "warnings": [KEYS_WARNING]}
     run, _ = make_run(app, FakeClient(json.dumps(reply).encode()))
     body = run.execute(hp.CheckState()).comment_payload()["body"]
-    assert "Warnings (they did not stop" not in body
+    assert "#### Warnings" not in body
     assert body.count(KEYS_WARNING) == 1
 
 
-def test_other_warnings_keep_the_live_message():
+def test_other_warnings_keep_the_usual_message():
     published = hp.Published(RUN_URL, {**SUCCESS, "warnings": ["Your app runs slowly until you add a cache."]})
     assert published.keys_missing == []
-    assert published.message.startswith("Your app Days Until (hack.x v0.1.0) is live.")
-    assert published.description == "Live: hack.x v0.1.0"
+    assert published.message.startswith(f"{EITHER_MESSAGE}\n\n{WARNINGS_TITLE}")
+    assert "add its API keys" not in published.message
+    assert published.description == DRAFT_STATUS
+
+
+# ---- the success message: how to reach this version in Pippa ----
+#
+# GitHub emails the comment to whoever pushed. What it says depends on the reply's `change` (the
+# app's first version, a new version number, or a draft pushed again), `review_status` (approved:
+# public at once, because review is switched off) and `live_version` (what everybody else gets).
+
+GUIDE_URL = "https://github.com/Pippa-Labs/pippa-hack-x/blob/HEAD/docs/REVIEW_AND_SHARING.md"
+GUIDE_LINE = f"More about versions, testers and review: [REVIEW_AND_SHARING.md in your repository]({GUIDE_URL})"
+PHRASE_MANIFEST = {"outcomes": [{"id": "days.until", "example_phrases": ["how long until Friday?"]}]}
+
+
+def published(manifest=PHRASE_MANIFEST, guide_url=GUIDE_URL, check_warnings="", **reply):
+    """A version published with `reply` added to SUCCESS; `check_warnings` are the build's."""
+    return hp.Published(RUN_URL, {**SUCCESS, **reply}, check_warnings, manifest, guide_url)
+
+
+FIRST_MESSAGE = (
+    "**Days Until is published.** Version 0.1.0 is in Pippa now as a private draft: only you can see it "
+    "until Pippa Labs approves it.\n\n"
+    "#### Try it in Pippa\n\n"
+    "1. Open [app.getpippa.ai/apps](https://app.getpippa.ai/apps), signed in with the Pippa account your "
+    "invitation was for.\n"
+    "2. Choose **Created by me**. Your app has a card there.\n"
+    "3. Press **Install v0.1.0**.\n"
+    "4. Ask Pippa something your app does, for example `how long until Friday?`.\n\n"
+    "When your app answers, the reply carries the badge **via Days Until 0.1.0**, so you know it was your "
+    "app.\n\n"
+    "While you're building, switch on **Always use my latest version** on the card: then every push is "
+    "what answers you in chat.\n\n"
+    "#### When it's ready\n\n"
+    "- **Let someone try it:** press **Share for testing** on the card and add the email address they "
+    "use for Pippa.\n"
+    "- **Make it public:** under **Versions** on the card, press **Submit for review** next to 0.1.0. "
+    "Pippa Labs reviews it, and once it's approved anyone can install it.\n\n"
+    "Can't see your app? Reload the Apps page: it loads the list only once.\n\n"
+    f"{GUIDE_LINE}"
+)
+
+NEW_VERSION_MESSAGE = (
+    "**Days Until 0.2.0 is published** as a private draft: only you and your testers can get it. "
+    "Everyone else keeps using 0.1.0, your live version, until 0.2.0 is approved.\n\n"
+    "#### Try the new version\n\n"
+    "You stay on the version you installed until you switch:\n\n"
+    "1. Open [app.getpippa.ai/apps](https://app.getpippa.ai/apps) and choose **Created by me**.\n"
+    "2. On your app's card, press **Update to latest**. If **Always use my latest version** is on, you "
+    "have 0.2.0 already.\n"
+    "3. Ask Pippa something your app does, for example `how long until Friday?`. The reply should carry "
+    "the badge **via Days Until 0.2.0**.\n\n"
+    "Your testers get 0.2.0 too, unless you chose a particular version for them under **Testers get**.\n\n"
+    "If **Always use my latest version** is on and you changed the app's name, summary or example "
+    "phrases, press **Uninstall** on the card, then **Install v0.2.0**: Pippa picks up that wording when "
+    "the app is installed.\n\n"
+    "#### When it's ready\n\n"
+    "Under **Versions** on the card, press **Submit for review** next to 0.2.0. Once it's approved, it "
+    "replaces 0.1.0 for everyone: people who have your app move to it the next time they ask Pippa. If "
+    "0.2.0 adds something new your app can do, they get an **Update** button instead, and choose.\n\n"
+    f"{GUIDE_LINE}"
+)
+
+SAME_VERSION_MESSAGE = (
+    "**Days Until 0.2.0 is updated.** You pushed version 0.2.0 again while it's still a draft, so its "
+    "code was replaced. Anyone on 0.2.0 gets the new code straight away, you included if it's installed "
+    "for you.\n\n"
+    "#### Try it\n\n"
+    "Ask Pippa something your app does, for example `how long until Friday?`. The reply should carry the "
+    "badge **via Days Until 0.2.0**. Not installed yet? Open "
+    "[app.getpippa.ai/apps](https://app.getpippa.ai/apps), choose **Created by me** and press "
+    "**Install v0.2.0**.\n\n"
+    "Changed the app's name, summary or example phrases? Press **Uninstall** on the card, then "
+    "**Install v0.2.0**: Pippa picks up that wording when the app is installed.\n\n"
+    "#### When it's ready\n\n"
+    "Under **Versions** on the card, press **Submit for review** next to 0.2.0. From then on 0.2.0 can't "
+    "change: for anything after that, raise `version:` in `manifest.yaml` (to 0.2.1, say) and push.\n\n"
+    f"{GUIDE_LINE}"
+)
+
+
+def test_the_first_version_says_how_to_find_install_and_try_it():
+    message = published(change="first", review_status="draft", live_version=None).message
+    assert message == FIRST_MESSAGE
+
+
+def test_a_new_version_says_who_keeps_the_live_one_and_how_to_switch():
+    message = published(change="new_version", review_status="draft", live_version="0.1.0", version="0.2.0").message
+    assert message == NEW_VERSION_MESSAGE
+
+
+def test_a_draft_pushed_again_says_its_code_was_replaced_in_place():
+    message = published(change="same_version", review_status="draft", live_version="0.1.0", version="0.2.0").message
+    assert message == SAME_VERSION_MESSAGE
+
+
+def test_a_new_version_of_an_app_nobody_else_has_yet():
+    message = published(change="new_version", review_status="draft", live_version=None, version="0.2.0").message
+    assert message.startswith(
+        "**Days Until 0.2.0 is published** as a private draft: only you and your testers can get it. Your "
+        "app isn't public yet.\n\n#### Try the new version\n\n"
+    )
+    assert "your live version" not in message and "replaces" not in message
+    assert ("#### When it's ready\n\nUnder **Versions** on the card, press **Submit for review** next to 0.2.0. "
+            "Pippa Labs reviews it, and once it's approved anyone can install it.\n\n") in message
+
+
+@pytest.mark.parametrize("live", [None, "", "   ", 5, ["0.1.0"], {"version": "0.1.0"}])
+def test_a_live_version_that_is_missing_or_not_text_is_no_live_version(live):
+    reply = {"change": "new_version", "review_status": "draft", "version": "0.2.0"}
+    if live is not None:
+        reply["live_version"] = live
+    assert published(**reply).live_version == ""
+    assert "Your app isn't public yet." in published(**reply).message
+
+
+def test_the_live_version_is_text_from_the_reply_and_is_escaped():
+    message = published(change="new_version", review_status="draft", version="0.2.0",
+                        live_version="0.1.0 <b>@octo</b>").message
+    assert "Everyone else keeps using 0.1.0 \\<b\\>`@`octo\\</b\\>, your live version" in message
+    assert "<b>" not in message and "@octo" not in message
+
+
+@pytest.mark.parametrize("change, headline", [
+    ("first", "**Days Until 0.1.0 is published, and it's live:** anyone in Pippa can install it."),
+    ("new_version", "**Days Until 0.1.0 is published, and it's live:** anyone in Pippa can install it."),
+    ("", "**Days Until 0.1.0 is published, and it's live:** anyone in Pippa can install it."),
+])
+def test_a_version_public_at_once_says_it_is_live_and_skips_review(change, headline):
+    """review_status approved: review is switched off on the runtime, so nothing waits for approval."""
+    outcome = published(change=change, review_status="approved", live_version="0.1.0")
+    message = outcome.message
+    assert message.split("\n\n", 1)[0] == headline
+    assert "#### When it's ready" not in message and "Submit for review" not in message
+    assert "private draft" not in message and "Testers get" not in message
+    assert message.endswith(GUIDE_LINE)
+    assert outcome.description == "Live: hack.x v0.1.0"
+
+
+def test_a_public_first_version_still_says_how_to_install_it():
+    message = published(change="first", review_status="approved", live_version="0.1.0").message
+    assert message == FIRST_MESSAGE.replace(
+        FIRST_MESSAGE.split("\n\n", 1)[0],
+        "**Days Until 0.1.0 is published, and it's live:** anyone in Pippa can install it.",
+    ).replace(FIRST_MESSAGE[FIRST_MESSAGE.index("#### When it's ready"):FIRST_MESSAGE.index("Can't see")], "")
+
+
+@pytest.mark.parametrize("status", [None, "draft", "pending", "rejected", "suspended", "APPROVED", "live", 1, True])
+def test_only_approved_is_public(status):
+    reply = {"change": "first"} if status is None else {"change": "first", "review_status": status}
+    outcome = published(**reply)
+    assert not outcome.public
+    assert outcome.description == DRAFT_STATUS
+    assert "it's live" not in outcome.message
+
+
+@pytest.mark.parametrize("reply", [
+    {},
+    {"change": None},
+    {"change": ""},
+    {"change": "renamed"},
+    {"change": "FIRST"},
+    {"change": 1},
+    {"change": ["first"]},
+    {"change": {"first": True}},
+])
+def test_a_missing_or_unknown_change_gets_the_message_for_either_case(reply):
+    outcome = published(manifest=None, guide_url="", **reply)
+    assert outcome.change == ""
+    assert outcome.message == EITHER_MESSAGE
+
+
+@pytest.mark.parametrize("change", [*hp.CHANGES, ""])
+@pytest.mark.parametrize("status", ["draft", "approved"])
+def test_missing_api_keys_come_first_in_every_case(change, status):
+    outcome = published(change=change, review_status=status, live_version="0.1.0", check_warnings=WARNINGS,
+                        warnings=[KEYS_WARNING, LEGACY_PUBLISHER])
+    message = outcome.message
+    headline, rest = message.split("\n\n", 1)
+    assert rest.startswith(f"{KEYS_SECTION}\n\n#### Try")
+    assert message.count(KEYS_WARNING) == 1
+    assert message.endswith(f"{WARNINGS_TITLE}{hp.fence(outcome.all_warnings)}")
+    assert outcome.description.endswith("; add its API keys in Pippa")
+    without_keys = published(change=change, review_status=status, live_version="0.1.0")
+    assert headline == without_keys.message.split("\n\n", 1)[0]
+    assert "First, add its API keys" not in without_keys.message
+
+
+@pytest.mark.parametrize("change", [*hp.CHANGES, ""])
+def test_the_warnings_section_is_last_in_every_case(change):
+    outcome = published(change=change, review_status="draft", live_version="0.1.0", check_warnings=WARNINGS,
+                        warnings=[LEGACY_PUBLISHER])
+    message = outcome.message
+    assert message.count("#### Warnings") == 1
+    section = message.split(f"\n\n{WARNINGS_TITLE}", 1)[1]
+    assert section == hp.fence(f"Pippa\n WARN {LEGACY_PUBLISHER}\n\n{WARNINGS}")
+    assert "#### Warnings" not in published(change=change, review_status="draft").message
+
+
+@pytest.mark.parametrize("change", [*hp.CHANGES, ""])
+@pytest.mark.parametrize("status", ["draft", "approved"])
+@pytest.mark.parametrize("keys", [[], [KEYS_WARNING]])
+def test_the_status_says_draft_or_live_and_fits_in_140_characters(change, status, keys):
+    long_id = "hack.a_rather_long_app_id_for_a_rather_long_app_name_x"
+    outcome = hp.Published(RUN_URL, {**SUCCESS, "app_id": long_id, "version": "10.20.300", "change": change,
+                                     "review_status": status, "warnings": keys})
+    state = "Live" if status == "approved" else "Published as a private draft"
+    expected = f"{state}: {long_id} v10.20.300" + ("; add its API keys in Pippa" if keys else "")
+    assert outcome.description == expected
+    assert len(expected) <= hp.STATUS_DESCRIPTION_LIMIT
+    assert outcome.status_payload()["description"] == expected
+
+
+def test_the_footer_tells_a_first_publisher_to_reload_and_everyone_where_the_guide_is():
+    for change, reload in (("first", True), ("", True), ("new_version", False), ("same_version", False)):
+        message = published(change=change, review_status="draft", live_version="0.1.0").message
+        assert ("Can't see your app? Reload the Apps page" in message) is reload
+        assert message.endswith(GUIDE_LINE)
+    assert "REVIEW_AND_SHARING" not in published(change="first", guide_url="").message
+
+
+# ---- the example phrase: what to ask Pippa ----
+
+@pytest.mark.parametrize("manifest, phrase", [
+    (PHRASE_MANIFEST, "how long until Friday?"),
+    ({"outcomes": [{"id": "a", "example_phrases": ["", "   ", 7, None, "  days\n until\tpayday "]}]},
+     "days until payday"),
+    ({"outcomes": [{"id": "a"}, {"id": "b", "example_phrases": []}, {"id": "c", "example_phrases": ["second"]}]},
+     "second"),
+    ({"outcomes": [{"id": "a", "example_phrases": ["first"]}, {"id": "b", "example_phrases": ["later"]}]}, "first"),
+    ({"outcomes": [{"id": "a", "example_phrases": ["x" * 500]}]}, "x" * (hp.PHRASE_LIMIT - 3) + "..."),
+])
+def test_the_example_phrase_is_the_first_one_that_is_not_empty(manifest, phrase):
+    assert hp.example_phrase(manifest) == phrase
+
+
+@pytest.mark.parametrize("manifest", [
+    None, {}, {"outcomes": None}, {"outcomes": "days.until"}, {"outcomes": {"id": "a"}},
+    {"outcomes": ["days.until", 5, None]}, {"outcomes": [{"example_phrases": "how long until Friday?"}]},
+    {"outcomes": [{"example_phrases": {"a": "b"}}]}, {"outcomes": [{"example_phrases": [["nested"], {"a": 1}]}]},
+])
+def test_a_manifest_of_another_shape_has_no_example_phrase(manifest):
+    assert hp.example_phrase(manifest) == ""
+    message = published(manifest=manifest, change="first").message
+    assert "4. Ask Pippa something your app does.\n" in message
+
+
+def test_the_example_phrase_is_quoted_as_code_whatever_it_holds():
+    phrase = "ask @octo about [this](https://example.com) <b>now</b> `x`"
+    message = published(manifest={"outcomes": [{"example_phrases": [phrase]}]}, change="first").message
+    assert f"for example {hp.code_span(phrase)}." in message
+    assert hp.code_span(phrase) == f"`` {phrase} ``"
+
+
+# ---- text from manifest.yaml in the comment: never a link, an image, HTML or a mention ----
+
+def outside_code(markdown):
+    """What GitHub would still read as Markdown: fenced blocks, escaped characters and code spans taken out."""
+    text = re.sub(r"^(`{3,})text\n.*?\n\1$", "", markdown, flags=re.MULTILINE | re.DOTALL)
+    text = re.sub(r"\\[!-/:-@\[-`{-~]", "", text)
+    return re.sub(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)", "", text)
+
+
+#: What would make Markdown, or what GitHub links after rendering, if it were not escaped or quoted.
+ACTIVE = re.compile(r"[\[\]<>!*_~|&`\\]|@|://|www\.|#\d|gh-\d", re.IGNORECASE)
+#: A heading or a list marker starting the text (a space always follows it in the message).
+LINE_MARKER = re.compile(r"^(?:#{1,6}|[+*-]|\d{1,9}[.)])(?:\s|$)")
+
+HOSTILE = [
+    "Ask @octo now", "x@example.com", "@octo/team", "@@octo", "mailto:x@example.com",
+    "Visit https://example.com/x", "HTTPS://EXAMPLE.COM", "See www.example.com today", "https://www.example.com",
+    "Bug #1 fixed", "GH-12 tool", "gh-3", "octo/repo#1 helper", "x#1",
+    "[click](https://example.com)", "![image](https://example.com/a.png)", "[ref]: https://example.com",
+    "<img src=x onerror=alert(1)>", "<b>bold</b>", "&lt;b&gt; &#64;octo", "**bold** _it_ ~~gone~~ | cell",
+    "a`b", "a`@`b", "a\\`@octo", "`` ` ``", "back\\slash\\", "# Heading", "###### Heading", "- item", "+ item",
+    "1. item", "12) item", "-", "1.", "  # spaced\n- out ",
+]
+
+
+@pytest.mark.parametrize("text", HOSTILE)
+def test_md_text_leaves_nothing_github_would_render_or_link(text):
+    escaped = hp.md_text(text)
+    assert not ACTIVE.search(outside_code(escaped)), escaped
+    assert not LINE_MARKER.match(escaped), escaped
+    # The words are all still there, in order: only escapes and code spans were added.
+    assert re.sub(r"[\\`\s]", "", escaped) == re.sub(r"[\\`\s]", "", text)
+
+
+@pytest.mark.parametrize("text, escaped", [
+    ("Ask @octo now", "Ask `@`octo now"),
+    ("@@octo", "`@@`octo"),
+    ("x@example.com", "x`@`example.com"),
+    ("Visit https://example.com/x", "Visit https`://`example.com/x"),
+    ("https://www.example.com", "https`://www.`example.com"),
+    ("See WWW.example.com", "See `WWW.`example.com"),
+    ("Bug #1 fixed", "Bug `#`1 fixed"),
+    ("GH-12 tool", "`GH-`12 tool"),
+    ("[click](https://example.com)", "\\[click\\](https`://`example.com)"),
+    ("![image](x.png)", "\\!\\[image\\](x.png)"),
+    ("<b>bold</b>", "\\<b\\>bold\\</b\\>"),
+    ("&amp;", "\\&amp;"),
+    ("a`@`b", "a\\``@`\\`b"),
+    ("# Heading", "\\# Heading"),
+    ("###### Heading", "#####\\# Heading"),
+    ("- item", "\\- item"),
+    ("+ item", "\\+ item"),
+    ("1. item", "1\\. item"),
+    ("12) item", "12\\) item"),
+    ("1.", "1\\."),
+])
+def test_md_text_escapes_and_quotes_exactly_what_it_must(text, escaped):
+    assert hp.md_text(text) == escaped
+
+
+@pytest.mark.parametrize("text", [
+    "Days Until", "Tide Times", "Café Finder", "R2-D2 Helper", "UK Tides 2025", "C# Tools", "#hashtag",
+    "Weather: today", "sigh-12 days", "0.1.0", "1.2.3-beta.4", "10.20.300", "Ask 3 things", "A+ Grades",
+])
+def test_md_text_leaves_ordinary_names_and_versions_as_written(text):
+    assert hp.md_text(text) == text
+
+
+def test_md_text_collapses_whitespace_and_cuts_long_text():
+    assert hp.md_text("  Tide \n\t Times  ") == "Tide Times"
+    assert hp.md_text("x" * 500) == "x" * (hp.NAME_LIMIT - 3) + "..."
+    assert hp.md_text("1" * 500, hp.VERSION_LIMIT) == "1" * (hp.VERSION_LIMIT - 3) + "..."
+
+
+@pytest.mark.parametrize("text, span", [
+    ("plain", "`plain`"),
+    ("a`b", "``a`b``"),
+    ("a``b`c", "```a``b`c```"),
+    ("`start", "`` `start ``"),
+    ("end`", "`` end` ``"),
+    ("`", "`` ` ``"),
+    ("  two \n lines ", "`two lines`"),
+    ("@octo [x](https://example.com) <b> #1", "`@octo [x](https://example.com) <b> #1`"),
+])
+def test_code_span_is_one_span_whatever_the_backticks(text, span):
+    assert hp.code_span(text) == span
+    assert outside_code(span) == ""
+
+
+def test_text_from_the_manifest_never_reaches_the_comment_unescaped():
+    hostile = "@octo [x](https://example.com) #1 <b>"
+    outcome = hp.Published(
+        RUN_URL,
+        {**SUCCESS, "name": hostile, "version": f"0.2.0 {hostile}", "live_version": f"0.1.0 {hostile}",
+         "change": "new_version", "review_status": "draft", "warnings": [f"{hostile} can't run until you add X"]},
+        hostile, {"outcomes": [{"example_phrases": [hostile]}]}, GUIDE_URL,
+    )
+    for message in (outcome.message, published(name=hostile, version=hostile, change="same_version").message):
+        ours = message.replace(hp.APPS_LINK, "").replace(GUIDE_LINE, "")
+        assert not re.search(r"@|://|www\.|#\d|<|\[", outside_code(ours).replace("```text", "")), ours
+    assert hp.md_text(hostile) in outcome.message
+
+
+# ---- version numbers, the guide's address, the reply's keys reaching the message ----
+
+@pytest.mark.parametrize("version, following", [
+    ("0.2.0", "0.2.1"), ("1.9.99", "1.9.100"), ("10.0.0", "10.0.1"),
+    ("0.2", ""), ("0.2.0-beta", ""), ("v0.2.0", ""), ("", ""), ("1.2.3.4", ""), ("1.2.x", ""), ("1234567.0.0", ""),
+])
+def test_next_version_is_the_next_patch_of_a_plain_version_only(version, following):
+    assert hp.next_version(version) == following
+
+
+def test_a_draft_of_another_shape_is_told_to_raise_its_version_without_an_example():
+    message = published(change="same_version", review_status="draft", version="0.2").message
+    assert "raise `version:` in `manifest.yaml` and push." in message
+    assert ", say)" not in message
+
+
+@pytest.mark.parametrize("environ, url", [
+    ({"GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": "Pippa-Labs/pippa-hack-x"}, GUIDE_URL),
+    ({"GITHUB_SERVER_URL": "https://github.com/", "GITHUB_REPOSITORY": "Pippa-Labs/pippa-hack-x"}, GUIDE_URL),
+    ({"GITHUB_SERVER_URL": "https://github.example.com", "GITHUB_REPOSITORY": "team_x/app.v2"},
+     "https://github.example.com/team_x/app.v2/blob/HEAD/docs/REVIEW_AND_SHARING.md"),
+])
+def test_the_guide_url_is_this_repositorys_review_guide(environ, url):
+    assert hp.review_guide_url(environ) == url
+
+
+@pytest.mark.parametrize("server", [
+    "", "http://github.com", "https://", "https://github.com/evil", "https://user@github.com",
+    "https://github.com?x=1", "https://github.com#x", "https://github.com:8443", "https://github..com",
+    "https://github.com)[x](https://example.com", "javascript:alert(1)", "https://github.com\n",
+    " https://github.com", "ftp://github.com",
+])
+def test_the_guide_url_needs_a_plain_https_server(server):
+    assert hp.review_guide_url({"GITHUB_SERVER_URL": server, "GITHUB_REPOSITORY": "Pippa-Labs/x"}) == ""
+
+
+@pytest.mark.parametrize("repository", [
+    "", "Pippa-Labs", "Pippa-Labs/", "/x", "a/b/c", "a/..", "a/.", "../b", "-a/b", "a b/c", "a/b)",
+    "a/b](https://example.com)", "a/b#c", "a/b?c", "a/b\n", "a/" + "b" * 101,
+])
+def test_the_guide_url_needs_an_owner_and_a_repository_name(repository):
+    assert hp.review_guide_url({"GITHUB_SERVER_URL": "https://github.com", "GITHUB_REPOSITORY": repository}) == ""
+    assert hp.review_guide_url({"GITHUB_SERVER_URL": "https://github.com"}) == ""
+
+
+def test_the_reply_and_the_manifest_reach_the_message_through_the_factory(app, capsys):
+    (app / "manifest.yaml").write_text(
+        MANIFEST + "outcomes:\n  - id: days.until\n    example_phrases:\n      - how long until Friday?\n"
+    )
+    reply = {**SUCCESS, "change": "first", "review_status": "draft", "live_version": None}
+    run, client = make_run(app, FakeClient(json.dumps(reply).encode()))
+    run.factory = hp.OutcomeFactory(RUN_URL, REF, "", GUIDE_URL)
+    outcome = run.execute(hp.CheckState())
+    assert outcome.comment_payload()["body"] == FIRST_MESSAGE
+    assert json.loads(client.calls[0]["Payload"])["manifest"]["outcomes"][0]["id"] == "days.until"
+    assert "YOUR APP IS PUBLISHED IN PIPPA" in capsys.readouterr().out
+
+
+def test_from_reply_without_a_manifest_has_no_example_phrase():
+    outcome = hp.OutcomeFactory(RUN_URL, REF).from_reply({**SUCCESS, "change": "first"})
+    assert outcome.phrase == "" and outcome.guide_url == ""
+    assert "4. Ask Pippa something your app does.\n" in outcome.message
+
+
+@pytest.mark.parametrize("status, banner", [("approved", "YOUR APP IS LIVE IN PIPPA"),
+                                            ("draft", "YOUR APP IS PUBLISHED IN PIPPA"),
+                                            (None, "YOUR APP IS PUBLISHED IN PIPPA")])
+def test_the_log_banner_says_live_only_for_a_public_version(status, banner, capsys):
+    hp.OutcomeFactory(RUN_URL, REF).from_reply({**SUCCESS, "review_status": status})
+    out = capsys.readouterr().out
+    assert banner in out
+    assert "  App      Days Until  (hack.x v0.1.0)\n  Can do   days.until\n" in out
+
+
+def test_the_log_banner_keeps_text_from_the_manifest_on_one_line(capsys):
+    """A line of the log that starts with "::" is a workflow command to the runner."""
+    reply = {**SUCCESS, "name": "Days\n::error::forged", "outcomes": ["a\n::add-mask::x"]}
+    hp.OutcomeFactory(RUN_URL, REF).from_reply(reply)
+    lines = capsys.readouterr().out.splitlines()
+    assert not [line for line in lines if line.lstrip().startswith("::")]
+    assert "  App      Days ::error::forged  (hack.x v0.1.0)" in lines
+
+
+def test_the_summary_quotes_each_outcome_as_code():
+    outcome = hp.Published(RUN_URL, {**SUCCESS, "outcomes": ["days.until", "a`b"]})
+    assert outcome.summary.endswith("\nOutcomes: `days.until`, ``a`b``\n")
+
+
+def test_main_links_the_review_guide_of_the_repository_that_ran(app, tmp_path, monkeypatch):
+    monkeypatch.setenv("GITHUB_SERVER_URL", "https://github.com")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "Pippa-Labs/pippa-hack-x")
+    reply = {**SUCCESS, "change": "first", "review_status": "draft"}
+    real_publisher = hp.LambdaPublisher
+    monkeypatch.setattr(hp, "LambdaPublisher", lambda: real_publisher(
+        client=FakeClient(json.dumps(reply).encode()), sleep=lambda _: None))
+    monkeypatch.setattr(hp, "ActionsTokenProvider", FakeToken)
+    out = tmp_path / "out"
+    assert hp.main(["--app-dir", str(app), "--run-url", RUN_URL, "--reference", REF, "--out-dir", str(out)]) == 0
+    body = json.loads((out / "comment.json").read_text())["body"]
+    assert body.endswith(f"\n\n{GUIDE_LINE}")
+    assert json.loads((out / "status.json").read_text())["description"] == DRAFT_STATUS
+
+    monkeypatch.delenv("GITHUB_REPOSITORY")
+    assert hp.main(["--app-dir", str(app), "--run-url", RUN_URL, "--reference", REF, "--out-dir", str(out)]) == 0
+    assert "REVIEW_AND_SHARING" not in json.loads((out / "comment.json").read_text())["body"]

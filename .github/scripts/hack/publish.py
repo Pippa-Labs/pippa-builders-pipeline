@@ -74,6 +74,40 @@ THROTTLE_BACKOFF_SECONDS = 2.0
 THROTTLE_CODE = "TooManyRequestsException"
 
 APP_URL = "https://app.getpippa.ai"
+APPS_LINK = f"[app.getpippa.ai/apps]({APP_URL}/apps)"
+#: What this publish did to the app, as the runtime says in the reply's `change`. A publisher or
+#: runtime that predates the field sends none: the message then covers both a first install and
+#: an update.
+CHANGE_FIRST = "first"  # the app's first version
+CHANGE_NEW_VERSION = "new_version"  # a version number this app had not published before
+CHANGE_SAME_VERSION = "same_version"  # a draft pushed again under its own number: replaced in place
+CHANGES = (CHANGE_FIRST, CHANGE_NEW_VERSION, CHANGE_SAME_VERSION)
+#: The reply's `review_status` of a version everybody gets at once (review switched off).
+APPROVED = "approved"
+#: The guide in every app repository that explains versions, testers and review.
+REVIEW_GUIDE = "docs/REVIEW_AND_SHARING.md"
+PHRASE_LIMIT = 120
+NAME_LIMIT = 80
+VERSION_LIMIT = 40
+#: A version number whose next one Pippa can suggest: 0.2.0 -> 0.2.1.
+PATCH_VERSION = re.compile(r"(\d{1,6})\.(\d{1,6})\.(\d{1,6})")
+#: Characters that could make text from manifest.yaml, in the middle of a sentence, into Markdown
+#: emphasis, a link, an image, HTML, an entity or a table cell. (GitHub's plain-text email shows
+#: any backslash, so nothing else is escaped.)
+MARKDOWN_SPECIAL = re.compile(r"([\\`*_\[\]<>!~|&])")
+#: What makes the start of a line a heading or a list item ("# ", "- ", "+ ", "1. ", "1) "), when
+#: a space follows (and one always does, after the text): a name starts the line under "First,
+#: add its API keys". Its last character is escaped.
+MARKDOWN_LINE_START = re.compile(r"^(#{1,6}|[+-]|\d{1,9}[.)])(?=\s|$)")
+#: What GitHub turns into a link or a mention AFTER the Markdown is rendered, so that no backslash
+#: stops it: an "@" (a mention notifies that account; also an email address), a web address
+#: ("://", or "www." starting a word) and an issue or pull request number ("#12", "GH-12"). Each
+#: goes in a code span of its own, which GitHub never links.
+GITHUB_REFERENCE = re.compile(r"(?:@|://|(?<![a-z0-9])www\.|#(?=\d)|(?<![a-z0-9])gh-(?=\d))+", re.IGNORECASE)
+#: The server of a run, on github.com or GitHub Enterprise: https and a host name, nothing else.
+GITHUB_SERVER = re.compile(r"https://[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*")
+#: A repository as GITHUB_REPOSITORY names it, owner/name, and never "." or "..".
+GITHUB_REPOSITORY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,99}/(?!\.\.?$)[A-Za-z0-9_.-]{1,100}")
 CODE_MARKER = "CODE_ERROR"
 REFUSED_MARKER = "REFUSED"
 PLATFORM_MARKER = "PLATFORM_ERROR"
@@ -248,6 +282,68 @@ def plain_account(name: str) -> str:
     return ACCOUNT_UNSAFE.sub("?", name)[:ACCOUNT_LIMIT]
 
 
+def code_span(text: str) -> str:
+    """Text as an inline Markdown code span: never a link, a mention or HTML, whatever it holds."""
+    text = " ".join(text.split())
+    longest = run = 0
+    for char in text:
+        run = run + 1 if char == "`" else 0
+        longest = max(longest, run)
+    marker = "`" * (longest + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{marker}{pad}{text}{pad}{marker}"
+
+
+def md_text(text: str, limit: int = NAME_LIMIT) -> str:
+    """Text from manifest.yaml (a name, a version) as plain words in a Markdown comment.
+
+    Markdown punctuation is escaped, so it never becomes a link, an image or HTML, and neither
+    does a heading or a list marker at the start. What GitHub links after rendering, where
+    escaping does not help (GITHUB_REFERENCE: "@someone" would notify that account, a web
+    address, "#12"), goes in a code span of its own. A name without any of it reads as written.
+    """
+    text = truncate(" ".join(text.split()), limit)
+    pieces, start = [], 0
+    for found in GITHUB_REFERENCE.finditer(text):
+        pieces += [MARKDOWN_SPECIAL.sub(r"\\\1", text[start:found.start()]), code_span(found.group())]
+        start = found.end()
+    pieces.append(MARKDOWN_SPECIAL.sub(r"\\\1", text[start:]))
+    marker = MARKDOWN_LINE_START.match(pieces[0])
+    if marker:
+        last = marker.end() - 1
+        pieces[0] = f"{pieces[0][:last]}\\{pieces[0][last:]}"
+    return "".join(pieces)
+
+
+def example_phrase(manifest: Mapping[str, Any] | None) -> str:
+    """The manifest's first example phrase, to suggest what to ask Pippa; "" when it has none."""
+    outcomes = (manifest or {}).get("outcomes")
+    for outcome in outcomes if isinstance(outcomes, list) else []:
+        phrases = outcome.get("example_phrases") if isinstance(outcome, dict) else None
+        for phrase in phrases if isinstance(phrases, list) else []:
+            if isinstance(phrase, str) and phrase.strip():
+                return truncate(" ".join(phrase.split()), PHRASE_LIMIT)
+    return ""
+
+
+def next_version(version: str) -> str:
+    """The patch release after version (0.2.0 -> 0.2.1), or "" for a number of another shape."""
+    match = PATCH_VERSION.fullmatch(version)
+    if not match:
+        return ""
+    major, minor, patch = (int(part) for part in match.groups())
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def review_guide_url(environ: Mapping[str, str]) -> str:
+    """Link to the review guide in this repository, or "" when the run does not say which one."""
+    server = environ.get("GITHUB_SERVER_URL", "").rstrip("/")
+    repository = environ.get("GITHUB_REPOSITORY", "")
+    if not GITHUB_SERVER.fullmatch(server) or not GITHUB_REPOSITORY.fullmatch(repository):
+        return ""
+    return f"{server}/{repository}/blob/HEAD/{REVIEW_GUIDE}"
+
+
 def started_by_another_account(environ: Mapping[str, str]) -> str:
     """Why the run may not publish because the account that pushed did not start it; "" when it did.
 
@@ -324,10 +420,25 @@ class Outcome(ABC):
 
 
 class Published(Outcome):
+    """A published version, and the comment that tells its builder how to reach it in Pippa.
+
+    GitHub emails the comment to whoever pushed, so it is written as that email: what happened,
+    how to try this version in Pippa, and what to do when it is ready. Which steps apply depends
+    on `change` (the app's first version, a new version number, or a draft pushed again) and on
+    whether the version is public at once (`review_status` approved: review switched off).
+    """
+
     kind = "success"
     state = "success"
 
-    def __init__(self, run_url: str, reply: dict[str, Any], warnings: str = "") -> None:
+    def __init__(
+        self,
+        run_url: str,
+        reply: dict[str, Any],
+        warnings: str = "",
+        manifest: Mapping[str, Any] | None = None,
+        guide_url: str = "",
+    ) -> None:
         super().__init__(run_url)
         self.warnings = truncate(warnings, WARNINGS_LIMIT)
         self.runtime_warnings = runtime_warnings(reply)
@@ -338,12 +449,22 @@ class Published(Outcome):
         self.name = str(reply["name"])
         self.outcomes = [str(item) for item in reply.get("outcomes") or []]
         self.function = str(reply.get("function") or "")
+        change = reply.get("change")
+        #: One of CHANGES, or "" from a publisher or runtime that does not say.
+        self.change = change if change in CHANGES else ""
+        live = reply.get("live_version")
+        #: The approved version everybody else gets, or "" when the app is not public.
+        self.live_version = live.strip() if isinstance(live, str) else ""
+        self.public = reply.get("review_status") == APPROVED
+        self.phrase = example_phrase(manifest)
+        self.guide_url = guide_url
 
     @property
     def description(self) -> str:
+        state = "Live" if self.public else "Published as a private draft"
         if self.keys_missing:
-            return f"Live: {self.app_id} v{self.version}; add its API keys in Pippa"
-        return f"Live: {self.app_id} v{self.version}"
+            return f"{state}: {self.app_id} v{self.version}; add its API keys in Pippa"
+        return f"{state}: {self.app_id} v{self.version}"
 
     @property
     def all_warnings(self) -> str:
@@ -362,29 +483,171 @@ class Published(Outcome):
 
     @property
     def message(self) -> str:
+        sections = [self._headline()]
         if self.keys_missing:
-            keys = "\n".join(f" WARN {sentence}" for sentence in self.keys_missing)
-            message = (
-                f"Your app {self.name} ({self.app_id} v{self.version}) is published, but it can't run "
-                f"until you add its API keys. Open {APP_URL}, go to Created by me, open the app and add "
-                "them under Keys. No push is needed: the keys stay in Pippa, never in GitHub.\n\n"
-                f"{fence(keys)}"
-            )
-        else:
-            message = (
-                f"Your app {self.name} ({self.app_id} v{self.version}) is live. "
-                f"Open {APP_URL}, go to Apps, install it and try it."
-            )
+            sections.append(self._keys())
+        sections.append(self._try_it())
+        if not self.public:
+            sections.append(self._when_ready())
+        sections.append(self._footer())
         if self.all_warnings:
-            message += (
-                "\n\nWarnings (they did not stop the publish; fix them and push again):\n\n"
+            sections.append(
+                "#### Warnings\n\nThese didn't stop the publish. Fix them and push again.\n\n"
                 f"{fence(self.all_warnings)}"
             )
-        return message
+        return "\n\n".join(section for section in sections if section)
+
+    # The pieces of the message. Names and numbers from manifest.yaml go through md_text, the
+    # example phrase through code_span: none of them can become a link, HTML or a mention.
+
+    @property
+    def _name(self) -> str:
+        return md_text(self.name)
+
+    @property
+    def _v(self) -> str:
+        return md_text(self.version, VERSION_LIMIT)
+
+    @property
+    def _badge(self) -> str:
+        return f"**via {self._name} {self._v}**"
+
+    @property
+    def _ask(self) -> str:
+        if self.phrase:
+            return f"Ask Pippa something your app does, for example {code_span(self.phrase)}."
+        return "Ask Pippa something your app does."
+
+    def _reinstall(self, lead: str) -> str:
+        """`lead` ends where the instruction starts: "..., press" or "...? Press"."""
+        return (
+            f"{lead} **Uninstall** on the card, then **Install v{self._v}**: Pippa picks up that wording "
+            "when the app is installed."
+        )
+
+    def _headline(self) -> str:
+        name, v = self._name, self._v
+        live = md_text(self.live_version, VERSION_LIMIT)
+        if self.change == CHANGE_SAME_VERSION:
+            return (
+                f"**{name} {v} is updated.** You pushed version {v} again while it's still a draft, so "
+                f"its code was replaced. Anyone on {v} gets the new code straight away, you included if "
+                "it's installed for you."
+            )
+        if self.public:
+            return f"**{name} {v} is published, and it's live:** anyone in Pippa can install it."
+        if self.change == CHANGE_FIRST:
+            return (
+                f"**{name} is published.** Version {v} is in Pippa now as a private draft: only you can "
+                "see it until Pippa Labs approves it."
+            )
+        headline = f"**{name} {v} is published** as a private draft: only you and your testers can get it."
+        if self.change == CHANGE_NEW_VERSION:
+            if self.live_version:
+                return f"{headline} Everyone else keeps using {live}, your live version, until {v} is approved."
+            return f"{headline} Your app isn't public yet."
+        return f"{headline[:-1]} until Pippa Labs approves it."
+
+    def _keys(self) -> str:
+        keys = "\n".join(f" WARN {sentence}" for sentence in self.keys_missing)
+        return (
+            "#### First, add its API keys\n\n"
+            f"{self._name} can't run until you add them. Open {APPS_LINK}, choose **Created by me**, "
+            "and press **Add** next to each key under **Keys** on the app's card. No push is needed: "
+            "the keys stay in Pippa, never in GitHub.\n\n"
+            f"{fence(keys)}"
+        )
+
+    def _try_it(self) -> str:
+        v = self._v
+        if self.change == CHANGE_FIRST:
+            return (
+                "#### Try it in Pippa\n\n"
+                f"1. Open {APPS_LINK}, signed in with the Pippa account your invitation was for.\n"
+                "2. Choose **Created by me**. Your app has a card there.\n"
+                f"3. Press **Install v{v}**.\n"
+                f"4. {self._ask}\n\n"
+                f"When your app answers, the reply carries the badge {self._badge}, so you know it was "
+                "your app.\n\n"
+                "While you're building, switch on **Always use my latest version** on the card: then "
+                "every push is what answers you in chat."
+            )
+        if self.change == CHANGE_NEW_VERSION:
+            return (
+                "#### Try the new version\n\n"
+                "You stay on the version you installed until you switch:\n\n"
+                f"1. Open {APPS_LINK} and choose **Created by me**.\n"
+                "2. On your app's card, press **Update to latest**. If **Always use my latest version** "
+                f"is on, you have {v} already.\n"
+                f"3. {self._ask} The reply should carry the badge {self._badge}.\n\n"
+                + ("" if self.public else
+                   f"Your testers get {v} too, unless you chose a particular version for them under "
+                   "**Testers get**.\n\n")
+                + self._reinstall(
+                    "If **Always use my latest version** is on and you changed the app's name, summary "
+                    "or example phrases, press"
+                )
+            )
+        if self.change == CHANGE_SAME_VERSION:
+            return (
+                "#### Try it\n\n"
+                f"{self._ask} The reply should carry the badge {self._badge}. Not installed yet? Open "
+                f"{APPS_LINK}, choose **Created by me** and press **Install v{v}**.\n\n"
+                + self._reinstall("Changed the app's name, summary or example phrases? Press")
+            )
+        return (
+            "#### Try it in Pippa\n\n"
+            f"1. Open {APPS_LINK} and choose **Created by me**.\n"
+            f"2. Press **Install v{v}** if your app isn't installed yet, or **Update to latest** if an "
+            "older version is. With **Always use my latest version** on, you have it already.\n"
+            f"3. {self._ask} The reply should carry the badge {self._badge}."
+        )
+
+    def _when_ready(self) -> str:
+        v = self._v
+        submit = f"Under **Versions** on the card, press **Submit for review** next to {v}."
+        if self.change == CHANGE_SAME_VERSION:
+            following = next_version(self.version)
+            example = f" (to {following}, say)" if following else ""
+            return (
+                f"#### When it's ready\n\n{submit} From then on {v} can't change: for anything after "
+                f"that, raise `version:` in `manifest.yaml`{example} and push."
+            )
+        if self.change == CHANGE_NEW_VERSION and self.live_version:
+            live = md_text(self.live_version, VERSION_LIMIT)
+            return (
+                f"#### When it's ready\n\n{submit} Once it's approved, it replaces {live} for everyone: "
+                "people who have your app move to it the next time they ask Pippa. If "
+                f"{v} adds something new your app can do, they get an **Update** button instead, and "
+                "choose."
+            )
+        if self.change == CHANGE_NEW_VERSION:
+            return (
+                f"#### When it's ready\n\n{submit} Pippa Labs reviews it, and once it's approved anyone can "
+                "install it."
+            )
+        return (
+            "#### When it's ready\n\n"
+            "- **Let someone try it:** press **Share for testing** on the card and add the email "
+            "address they use for Pippa.\n"
+            f"- **Make it public:** under **Versions** on the card, press **Submit for review** next to "
+            f"{v}. Pippa Labs reviews it, and once it's approved anyone can install it."
+        )
+
+    def _footer(self) -> str:
+        lines = []
+        if self.change in (CHANGE_FIRST, ""):
+            lines.append("Can't see your app? Reload the Apps page: it loads the list only once.")
+        if self.guide_url:
+            lines.append(
+                f"More about versions, testers and review: [{REVIEW_GUIDE.rsplit('/', 1)[-1]} in your "
+                f"repository]({self.guide_url})"
+            )
+        return "\n\n".join(lines)
 
     @property
     def summary(self) -> str:
-        outcomes = ", ".join(f"`{item}`" for item in self.outcomes) or "-"
+        outcomes = ", ".join(code_span(item) for item in self.outcomes) or "-"
         return f"{super().summary}\nOutcomes: {outcomes}\n"
 
 
@@ -472,10 +735,11 @@ class PlatformFailure(Outcome):
 class OutcomeFactory:
     """Builds the outcome from the check verdict, a publisher reply or an error."""
 
-    def __init__(self, run_url: str, reference: str, warnings: str = "") -> None:
+    def __init__(self, run_url: str, reference: str, warnings: str = "", guide_url: str = "") -> None:
         self.run_url = run_url
         self.reference = reference
         self.warnings = warnings
+        self.guide_url = guide_url
 
     def code(self, error: str) -> CodeFailure:
         return CodeFailure(self.run_url, error)
@@ -503,19 +767,26 @@ class OutcomeFactory:
         LOG.error("Check job ended with result=%r verdict=%r", result, verdict)
         return self.platform()
 
-    def from_reply(self, reply: Any) -> Outcome:
+    def from_reply(self, reply: Any, manifest: Mapping[str, Any] | None = None) -> Outcome:
         if not isinstance(reply, dict):
             raise PlatformError(f"Publisher reply is not an object: {reply!r:.400}")
         if reply.get("ok") is True:
             missing = [name for name in SUCCESS_FIELDS if not reply.get(name)]
             if missing:
                 raise PlatformError(f"Publisher success reply lacks {missing}: {reply!r:.400}")
-            published = Published(self.run_url, reply, self.warnings)
+            published = Published(self.run_url, reply, self.warnings, manifest, self.guide_url)
             notes = "".join(f"  Warning  {sentence}\n" for sentence in published.runtime_warnings)
+            banner = "YOUR APP IS LIVE IN PIPPA" if published.public else "YOUR APP IS PUBLISHED IN PIPPA"
+            # One line each: a line break in a name from manifest.yaml could otherwise start a line
+            # of the log with "::", which the runner reads as a workflow command.
+            name, app_id, version, can_do = (
+                " ".join(text.split())
+                for text in (published.name, published.app_id, published.version, ", ".join(published.outcomes))
+            )
             print(
-                f"\n{'=' * 68}\n  YOUR APP IS LIVE IN PIPPA\n\n"
-                f"  App      {published.name}  ({published.app_id} v{published.version})\n"
-                f"  Can do   {', '.join(published.outcomes) or '-'}\n{notes}{'=' * 68}"
+                f"\n{'=' * 68}\n  {banner}\n\n"
+                f"  App      {name}  ({app_id} v{version})\n"
+                f"  Can do   {can_do or '-'}\n{notes}{'=' * 68}"
             )
             return published
         error_class = reply.get("error_class")
@@ -817,7 +1088,7 @@ class PublishRun:
             return {"token": self.token_provider.token(TOKEN_AUDIENCE), "manifest": manifest, "code_zip_b64": code}
 
         reply = self.publisher_factory().publish(make_event)
-        return self.factory.from_reply(reply)
+        return self.factory.from_reply(reply, manifest)
 
 
 class ReportWriter:
@@ -879,7 +1150,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     run = PublishRun(
         app_dir=args.app_dir,
-        factory=OutcomeFactory(args.run_url, args.reference, read_details(args.check_warnings_file)),
+        factory=OutcomeFactory(args.run_url, args.reference, read_details(args.check_warnings_file),
+                               review_guide_url(os.environ)),
         token_provider=ActionsTokenProvider(),
         publisher_factory=LambdaPublisher,
     )
